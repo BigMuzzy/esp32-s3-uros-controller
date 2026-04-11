@@ -88,10 +88,10 @@ Documented as Architecture Decision Records in [`adr/`](adr/).
 firmware/
 ├── main/
 │   ├── main.c                  # app_main — task creation & init
-│   ├── uros_task.c             # micro-ROS spin loop
-│   ├── can_task.c              # TWAI TX/RX
+│   ├── uros_task.h / .c        # micro-ROS spin loop
+│   ├── can_task.h / .c         # TWAI TX/RX
 │   ├── diff_drive.h / .c       # kinematics & odometry
-│   ├── rc_failsafe.c           # RC PWM + arcade mixing + failsafe
+│   ├── rc_failsafe.h / .c      # RC PWM + arcade mixing + failsafe
 │   └── vesc_can.h / .c         # VESC CAN frame encode/decode
 ├── components/
 │   └── micro_ros_espidf_component/
