@@ -1,0 +1,14 @@
+# Build output
+firmware/build/
+
+# Session notes (local only)
+SESSION_NOTES.md
+
+# Backups
+esp32-s3-uros-driver-backups/
+
+# ESP-IDF
+sdkconfig.old
+
+# IDE
+.vscode/
