@@ -82,7 +82,73 @@ Documented as Architecture Decision Records in [`adr/`](adr/).
 | 0005  | Odometry computation               | Proposed |
 | 0006  | RC failsafe behavior & mixing      | Proposed |
 
-## Source Layout (planned)
+## Building & Flashing
+
+### Prerequisites
+
+- **ESP-IDF v5.4** — [installation guide](https://docs.espressif.com/projects/esp-idf/en/v5.4/esp32s3/get-started/)
+- **Python packages** for micro-ROS build:
+  ```bash
+  pip install catkin_pkg lark empy==3.3.4
+  ```
+
+### Clone
+
+```bash
+git clone --recursive https://github.com/BigMuzzy/esp32-s3-uros-controller.git
+cd esp32-s3-uros-controller/firmware
+```
+
+If already cloned without `--recursive`:
+```bash
+git submodule update --init --recursive
+```
+
+### Build
+
+```bash
+source ~/esp/esp-idf/export.sh
+idf.py build
+```
+
+The first build takes several minutes — the micro-ROS component
+downloads and cross-compiles the ROS 2 middleware. Subsequent builds
+are incremental.
+
+### Flash
+
+Connect the board via USB-C, then:
+
+```bash
+idf.py -p /dev/ttyACM0 flash
+```
+
+### Monitor
+
+```bash
+idf.py -p /dev/ttyACM0 monitor
+```
+
+**Note:** In production the USB-C port is used by the micro-ROS
+agent (USB-CDC transport). Serial monitor output goes to UART0
+or should be disabled. During development, monitor and micro-ROS
+agent cannot use the same port simultaneously.
+
+### Build, Flash & Monitor (combined)
+
+```bash
+idf.py -p /dev/ttyACM0 flash monitor
+```
+
+### Menuconfig
+
+```bash
+idf.py menuconfig
+```
+
+Relevant settings under `micro-ROS Settings` and `Component config → TWAI`.
+
+## Source Layout
 
 ```
 firmware/
