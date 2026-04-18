@@ -13,7 +13,7 @@
  * Supported commands:
  *   TX: CAN_PACKET_SET_RPM  (cmd 3) — ERPM set-point, 4-byte big-endian
  *   RX: CAN_PACKET_STATUS   (cmd 9) — ERPM, current, duty
- *   RX: CAN_PACKET_STATUS_4 (cmd 14) — tachometer, voltage
+ *   RX: CAN_PACKET_STATUS_4 (cmd 14) — tachometer (cumulative ERPM ticks), voltage
  *
  * Requires TWAI driver to be initialized separately (see can_task.h).
  */

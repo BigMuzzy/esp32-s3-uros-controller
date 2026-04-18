@@ -65,9 +65,8 @@ these to compute odometry and publish telemetry. Key frames:
 |--------------------------|--------|-----------------------------------|
 | `CAN_PACKET_STATUS`      | 9      | ERPM, current, duty cycle         |
 | `CAN_PACKET_STATUS_4`    | 14     | Tachometer (cumulative ERPM ticks), voltage in   |
-| `CAN_PACKET_STATUS_5`    | 15     | Tachometer (absolute), voltage in |
 
-- **Tachometer** from STATUS_4/5 gives cumulative motor revolutions
+- **Tachometer** from STATUS_4 gives cumulative motor revolutions
   for odometry (see ADR-0005).
 - **ERPM** from STATUS gives real-time speed for diagnostics.
 - **Voltage/current** from STATUS frames publishes as motor telemetry.

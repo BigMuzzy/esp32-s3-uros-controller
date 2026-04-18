@@ -39,8 +39,7 @@ extern "C" {
 #define CAN_TX_TASK_PRIO      5       /* higher than uros_task */
 #define CAN_RX_TASK_PRIO      6       /* highest — don't miss frames */
 
-#define VESC_ID_LEFT          1
-#define VESC_ID_RIGHT         2
+/* VESC_ID_LEFT / VESC_ID_RIGHT are defined in vesc_can.h (included above). */
 
 /* ── Initialization ──────────────────────────────────────────────── */
 

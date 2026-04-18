@@ -14,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include <inttypes.h>
 #include <string.h>
 
 static const char *TAG = "can_task";
@@ -80,14 +81,29 @@ static void can_tx_task(void *arg)
             break;
         }
 
-        /* Send ERPM commands to both VESCs */
+        /* Send ERPM commands to both VESCs. Log TX failures at most
+         * once per second so a bus-off or TX-queue-full condition is
+         * visible without flooding the log. */
         twai_message_t msg;
+        esp_err_t tx_ret;
+        static uint32_t s_tx_err_count;
+        static TickType_t s_last_tx_err_log;
 
         vesc_can_encode_rpm(VESC_ID_LEFT, erpm.left_erpm, &msg);
-        twai_transmit(&msg, pdMS_TO_TICKS(5));
+        tx_ret = twai_transmit(&msg, pdMS_TO_TICKS(5));
+        if (tx_ret != ESP_OK) s_tx_err_count++;
 
         vesc_can_encode_rpm(VESC_ID_RIGHT, erpm.right_erpm, &msg);
-        twai_transmit(&msg, pdMS_TO_TICKS(5));
+        tx_ret = twai_transmit(&msg, pdMS_TO_TICKS(5));
+        if (tx_ret != ESP_OK) s_tx_err_count++;
+
+        if (s_tx_err_count > 0 &&
+            (xTaskGetTickCount() - s_last_tx_err_log) >= pdMS_TO_TICKS(1000)) {
+            ESP_LOGW(TAG, "TWAI TX errors: %" PRIu32 " in last ~1s (latest: %s)",
+                     s_tx_err_count, esp_err_to_name(tx_ret));
+            s_tx_err_count = 0;
+            s_last_tx_err_log = xTaskGetTickCount();
+        }
     }
 }
 
