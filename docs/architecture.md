@@ -81,6 +81,7 @@ Documented as Architecture Decision Records in [`adr/`](adr/).
 | 0004  | Diff-drive kinematics on ESP32     | Proposed |
 | 0005  | Odometry computation               | Proposed |
 | 0006  | RC failsafe behavior & mixing      | Proposed |
+| 0007  | CAN bus topology & termination     | Proposed |
 
 ## Building & Flashing
 
