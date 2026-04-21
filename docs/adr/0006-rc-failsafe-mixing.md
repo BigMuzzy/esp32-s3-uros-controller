@@ -9,10 +9,20 @@ The robot needs a manual override / failsafe mode when the master PC
 is unreachable or misbehaving. An RC receiver connected to the ESP32-S3
 provides human-in-the-loop control independent of the software stack.
 
-The ESP32-S3 has 16 free GPIOs on the 20-pin header (GPIO 1–14, 43, 44)
-after accounting for CAN (15, 16), RS485 (17, 18, 21), USB (19, 20),
-I2C/RTC (38, 39), and CH1 control (47). The MCPWM capture peripheral
-can read PWM on any GPIO via the GPIO matrix.
+The Waveshare ESP32-S3-RS485-CAN exposes GPIOs through three
+connectors:
+
+- **20-pin header** (2 × 10):
+  - Column 1: 3.3 V, GND, GPIO43 (TX), GPIO44 (RX), GPIO3, 4, 5, 6, 7, 8
+  - Column 2: 5 V, GND, GPIO20 (USB D+), GPIO19 (USB D−), GPIO14, 13, 12, 11, 10, 9
+- **SH1.0 connector**: GPIO1, GPIO2
+- **Dedicated CAN connector**: GPIO15, GPIO16 (not available as GPIO)
+
+GPIO19/20 are consumed by the USB-CDC micro-ROS transport (ADR-0002),
+and GPIO43/44 are the default UART0 console pins. That leaves GPIO3–14
+on the header plus GPIO1/2 on the SH1.0 connector as free I/O for
+application use. The MCPWM capture peripheral can read PWM on any
+GPIO via the GPIO matrix.
 
 ## Decision
 
