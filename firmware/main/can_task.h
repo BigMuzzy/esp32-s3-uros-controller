@@ -59,19 +59,27 @@ extern "C" {
 #define VESC_PING_TIMEOUT_MS          100
 #define VESC_PING_RETRIES             2
 
+/* Runtime watchdog (ADR-0009 Stage C).  If no STATUS frame arrives
+ * from a given VESC for this long, the VESC is marked offline and
+ * can_tx_task forces ERPM=0 regardless of drive mode.  At 50 Hz
+ * broadcast (default), 200 ms = 10 missed frames. */
+#define VESC_STATUS_TIMEOUT_MS        200
+
 /* ── Types ───────────────────────────────────────────────────────── */
 
 /**
- * Per-VESC health snapshot.  Populated by can_rx_task, read by any core.
+ * Per-VESC health snapshot.  Populated by can_rx_task + can_tx_task
+ * watchdog, read by any core.
  *
  * Fields reflect the most recent observed state:
- *   online         — set once boot-time presence check passes.  Cleared
- *                    by the runtime watchdog when status stops arriving
- *                    (Stage C, not yet implemented).
- *   voltage_in     — last decoded STATUS_4 input voltage (volts).  0 if
- *                    no STATUS_4 has been received yet.
- *   fault_code     — reserved for STATUS_6 decode (Stage B/C).  Always 0
- *                    at present.
+ *   online         — true when boot check passed AND the runtime
+ *                    watchdog has seen a STATUS frame within
+ *                    VESC_STATUS_TIMEOUT_MS.  Cleared by the watchdog
+ *                    on timeout; re-set when STATUS resumes (boot-time
+ *                    failure is sticky until reboot).
+ *   voltage_in     — last decoded STATUS_5 input voltage (volts).  0 if
+ *                    no STATUS_5 has been received yet.
+ *   fault_code     — reserved for STATUS_6 decode.  Always 0 at present.
  *   last_status_ms — esp_timer-based timestamp (ms) of the last STATUS
  *                    frame from this VESC.  0 if never seen.
  */

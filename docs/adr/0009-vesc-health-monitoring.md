@@ -1,6 +1,6 @@
 # ADR-0009: VESC Health Monitoring & Arming Policy
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-04-21
 
 ## Context
@@ -77,28 +77,36 @@ A missing PONG with present STATUS is theoretically possible but
 only via misconfigured firmware or bus-addressing collisions; the
 log in that case explicitly names the inconsistency.
 
-### Stage C — Runtime watchdog & failsafe integration (planned)
+### Stage C — Runtime watchdog & failsafe integration (implemented)
 
-Each tick of `can_tx_task` compares `esp_timer_get_time() -
-last_status_ms` per VESC against `VESC_STATUS_TIMEOUT_MS`
-(200 ms default). If the timeout trips:
+Each tick of `can_tx_task` (20 ms) runs `vesc_watchdog_check()`:
 
-- Clear `vesc_health.online` for that VESC.
-- Force `erpm = {0, 0}` regardless of `drive_mode_t`.
-- Publish the degraded state on the failsafe / diagnostics topic.
+- Compares `esp_timer_get_time()/1000 − last_status_ms` per VESC
+  against `VESC_STATUS_TIMEOUT_MS` (200 ms default — 10 missed
+  frames at the 50 Hz default broadcast rate).
+- On timeout, logs the event, clears `vesc_health.online`, and
+  forces `erpm = {0, 0}` in the TX path regardless of `drive_mode_t`.
+- On recovery (status frames resume), logs and re-enables commands
+  for that VESC.
 
-Once the VESC resumes broadcasting, `online` is set again, but
-`BIT_ARMED` is **not** cleared by the watchdog — a runtime dropout
-does not require a reboot to recover, it just forces a stop for its
-duration.
+The boot-time `online = false` state is **sticky**: if a VESC failed
+the boot check, a later appearance of status frames does not arm it.
+Runtime watchdog only downgrades a previously-armed VESC and can
+re-upgrade it — the `BIT_ARMED` consent is still required.
 
-### Orthogonal: TWAI bus-health alerts
+The watchdog runs inside the existing `can_tx_task` rather than in a
+separate task to avoid an additional context switch and to keep the
+"do we send non-zero ERPM this tick?" decision local to one place.
+
+### Orthogonal: TWAI bus-health alerts (implemented)
 
 `twai_general_config_t.alerts_enabled` is configured with
 `BUS_ERROR | BUS_OFF | ERR_PASS | TX_FAILED | RX_QUEUE_FULL`.
-A periodic `twai_read_alerts()` call (folded into `can_tx_task`
-or a small dedicated task in Stage C) logs transitions and
-invokes `twai_initiate_recovery()` on bus-off.
+`twai_alert_handle()` runs at the top of each `can_tx_task` tick,
+logs transitions, and auto-recovers from bus-off by calling
+`twai_initiate_recovery()` followed by `twai_start()` (retried
+with a 10 ms delay for up to 100 ms while the recovery timer
+runs out).
 
 This distinguishes "bus wiring/termination bad" from "one VESC
 missing" — the former manifests as bus errors; the latter as

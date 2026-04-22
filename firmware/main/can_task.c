@@ -72,6 +72,106 @@ static int32_t s_erpm_right;
 
 /* ── can_tx_task ─────────────────────────────────────────────────── */
 
+/* Per-VESC runtime watchdog.  Returns true if all VESCs have reported
+ * STATUS recently; updates s_vesc_health[i].online accordingly and
+ * logs edge transitions. */
+static bool vesc_watchdog_check(uint32_t now_ms)
+{
+    static bool s_was_online[2] = { true, true };
+    const uint8_t ids[2] = { VESC_ID_LEFT, VESC_ID_RIGHT };
+    bool all_online = true;
+
+    for (int i = 0; i < 2; i++) {
+        uint32_t last_ms;
+        bool boot_online;
+        taskENTER_CRITICAL(&s_status_mux);
+        last_ms     = s_vesc_health[i].last_status_ms;
+        boot_online = s_vesc_health[i].online;
+        taskEXIT_CRITICAL(&s_status_mux);
+
+        /* Only considered online if (a) boot check passed and
+         * (b) a STATUS frame arrived within the timeout window. */
+        bool fresh = (last_ms != 0) &&
+                     ((now_ms - last_ms) <= VESC_STATUS_TIMEOUT_MS);
+        bool online = boot_online && fresh;
+
+        if (online != s_was_online[i]) {
+            if (online) {
+                ESP_LOGW(TAG, "VESC %u: status recovered", ids[i]);
+            } else {
+                ESP_LOGE(TAG, "VESC %u: status timeout (last %" PRIu32
+                              " ms ago) — forcing stop",
+                         ids[i], now_ms - last_ms);
+            }
+            s_was_online[i] = online;
+
+            /* Publish the runtime state so /vesc/health (when added)
+             * reflects the watchdog verdict, not just the boot result.
+             * Note: boot-time `online = false` is sticky — runtime
+             * watchdog only downgrades a previously-armed VESC. */
+            taskENTER_CRITICAL(&s_status_mux);
+            if (boot_online) {
+                s_vesc_health[i].online = online;
+            }
+            taskEXIT_CRITICAL(&s_status_mux);
+        }
+
+        if (!online) all_online = false;
+    }
+
+    return all_online;
+}
+
+/* Read and handle TWAI bus-health alerts.  Auto-recovers from BUS_OFF
+ * by calling twai_initiate_recovery() then twai_start() after a short
+ * delay.  Bus errors can occur at ~50 Hz during a fault, so they are
+ * rate-limited to at most one summary log per second; BUS_OFF itself
+ * is always logged immediately.  Called from can_tx_task; non-blocking. */
+static void twai_alert_handle(void)
+{
+    static uint32_t s_bus_err_count;
+    static uint32_t s_err_pass_count;
+    static uint32_t s_rx_full_count;
+    static TickType_t s_last_summary;
+
+    uint32_t alerts = 0;
+    if (twai_read_alerts(&alerts, 0) == ESP_OK && alerts != 0) {
+        if (alerts & TWAI_ALERT_BUS_ERROR)     s_bus_err_count++;
+        if (alerts & TWAI_ALERT_ERR_PASS)      s_err_pass_count++;
+        if (alerts & TWAI_ALERT_RX_QUEUE_FULL) s_rx_full_count++;
+
+        if (alerts & TWAI_ALERT_BUS_OFF) {
+            ESP_LOGE(TAG, "TWAI BUS-OFF — initiating recovery");
+            (void)twai_initiate_recovery();
+            /* Wait briefly for the recovery timer (128 * 11 recessive bits
+             * @ 500 kbit/s ≈ 2.8 ms).  twai_start() fails until recovery
+             * completes; retry a few times. */
+            for (int i = 0; i < 10; i++) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+                if (twai_start() == ESP_OK) {
+                    ESP_LOGI(TAG, "TWAI restarted after bus-off");
+                    break;
+                }
+            }
+        }
+    }
+
+    /* Emit a rolling summary at most once per second when any rate-
+     * limited alert has been seen.  Keeps faults visible without
+     * drowning the log at 50 lines/s. */
+    TickType_t now = xTaskGetTickCount();
+    if ((s_bus_err_count || s_err_pass_count || s_rx_full_count) &&
+        (now - s_last_summary) >= pdMS_TO_TICKS(1000)) {
+        ESP_LOGW(TAG, "TWAI alerts in last ~1s: bus_err=%" PRIu32
+                      " err_pass=%" PRIu32 " rx_full=%" PRIu32,
+                 s_bus_err_count, s_err_pass_count, s_rx_full_count);
+        s_bus_err_count  = 0;
+        s_err_pass_count = 0;
+        s_rx_full_count  = 0;
+        s_last_summary   = now;
+    }
+}
+
 static void can_tx_task(void *arg)
 {
     TickType_t last_wake = xTaskGetTickCount();
@@ -79,16 +179,23 @@ static void can_tx_task(void *arg)
     for (;;) {
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CAN_TX_PERIOD_MS));
 
+        twai_alert_handle();
+
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        bool vesc_ok = vesc_watchdog_check(now_ms);
+
         /* Hard gate: until the boot-time health check arms the system,
          * only transmit ERPM=0.  This keeps the bus active (so VESCs
          * that require periodic commands don't time out) while making
-         * sure we never command motion against an unhealthy VESC. */
+         * sure we never command motion against an unhealthy VESC.
+         * The runtime watchdog (vesc_ok) also forces stop on any
+         * VESC that has stopped broadcasting STATUS. */
         bool armed = (xEventGroupGetBits(s_can_events) & BIT_ARMED) != 0;
 
         drive_mode_t mode = rc_failsafe_get_mode();
         wheel_erpm_t erpm = { .left_erpm = 0, .right_erpm = 0 };
 
-        if (armed) {
+        if (armed && vesc_ok) {
             switch (mode) {
             case DRIVE_MODE_AUTONOMOUS: {
                 cmd_vel_t cmd;
