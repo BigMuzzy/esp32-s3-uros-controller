@@ -40,8 +40,8 @@ After `twai_start()` and before the TX task begins commanding motion:
 1. Start `can_rx_task` first.
 2. Wait up to `VESC_HEALTH_BOOT_TIMEOUT_MS` (1500 ms default) for
    every configured VESC ID to broadcast both `CAN_PACKET_STATUS`
-   (cmd 9) and `CAN_PACKET_STATUS_4` (cmd 14).
-3. Verify `STATUS_4.voltage_in ∈ [VESC_VOLTAGE_MIN_V,
+   (cmd 9) and `CAN_PACKET_STATUS_5` (cmd 27).
+3. Verify `STATUS_5.voltage_in ∈ [VESC_VOLTAGE_MIN_V,
    VESC_VOLTAGE_MAX_V]`.
 4. If all checks pass, set `BIT_ARMED` in the CAN event group.
 5. Start `can_tx_task`. The task *always* runs, but transmits
@@ -52,6 +52,13 @@ After `twai_start()` and before the TX task begins commanding motion:
 Rationale for transmitting ERPM=0 rather than halting the firmware:
 the system remains observable (debug console, diagnostic topics)
 so the operator can fix wiring or configuration without reflashing.
+
+Note: earlier drafts of this ADR and an earlier firmware revision
+referenced `STATUS_4` (cmd 14) as the tachometer + voltage source.
+That packet is actually `STATUS_2` in the VESC protocol and carries
+amp-hours; the tachometer + `v_in` payload is in `STATUS_5` (cmd 27).
+The decode and the VESC Tool requirement below reflect the correct
+packet.
 
 ### Stage B — Active ping/pong (implemented)
 
@@ -84,10 +91,14 @@ Each tick of `can_tx_task` (20 ms) runs `vesc_watchdog_check()`:
 - Compares `esp_timer_get_time()/1000 − last_status_ms` per VESC
   against `VESC_STATUS_TIMEOUT_MS` (200 ms default — 10 missed
   frames at the 50 Hz default broadcast rate).
-- On timeout, logs the event, clears `vesc_health.online`, and
-  forces `erpm = {0, 0}` in the TX path regardless of `drive_mode_t`.
-- On recovery (status frames resume), logs and re-enables commands
-  for that VESC.
+- Re-validates the most recent `voltage_in` against the
+  `[VESC_VOLTAGE_MIN_V, VESC_VOLTAGE_MAX_V]` window, so battery
+  sag under load trips the same failsafe path as a status timeout.
+- On either condition, logs the event with the offending value,
+  clears `vesc_health.online`, and forces `erpm = {0, 0}` in the
+  TX path regardless of `drive_mode_t`.
+- On recovery (status frames resume and voltage is back in range),
+  logs and re-enables commands for that VESC.
 
 The boot-time `online = false` state is **sticky**: if a VESC failed
 the boot check, a later appearance of status frames does not arm it.
@@ -112,11 +123,33 @@ This distinguishes "bus wiring/termination bad" from "one VESC
 missing" — the former manifests as bus errors; the latter as
 silent RX (no broadcasts observed).
 
-### Orthogonal: fault code (Stage B/C)
+### Orthogonal: fault code (deferred)
 
-`CAN_PACKET_STATUS_6` (cmd 28) carries the VESC fault code. Decoded
-in `vesc_can.c`, stored in `vesc_health_t.fault_code`. A non-zero
-fault latches `online = false` until the VESC clears it.
+`vesc_health_t` carries a `fault_code` field intended for the VESC
+fault state, but on FW 7.0 the periodic STATUS_1..6 packets do not
+include a latched fault field; the fault code is served via the
+request/response path (`CAN_PACKET_GET_VALUES` / `_SETUP`). Adding
+this requires a small request/response state machine in `vesc_can.c`
+and is deferred as a follow-up; the field stays as 0 at runtime until
+then.
+
+### Host visibility: `/vesc/{left,right}/battery` (implemented)
+
+`uros_task` publishes a `sensor_msgs/BatteryState` per VESC:
+
+- `voltage`  — `STATUS_5.voltage_in`.
+- `present`  — `vesc_health.online` (reflects boot check + runtime
+  watchdog verdict).
+- Other fields are `NaN` / `UNKNOWN` per `sensor_msgs/BatteryState`
+  convention since they are not measured by this layer.
+
+Topic names use `left` / `right` rather than `1` / `2` because ROS 2
+topic-name validation (REP 144) forbids any path segment starting
+with a digit — the wheel-side label also reads more naturally.
+
+This change raised `RMW_UXRCE_MAX_PUBLISHERS` from the default to 8
+in `firmware/app-colcon.meta` to cover odom + failsafe + two battery
+topics with headroom.
 
 ## Configuration
 
@@ -147,7 +180,7 @@ from issuing motion commands that land nowhere.
 ### B. Ping-only, no passive check
 
 Authoritative for liveness but loses voltage plausibility (which
-requires `STATUS_4`) and wastes the existing status broadcasts.
+requires `STATUS_5`) and wastes the existing status broadcasts.
 Kept as Stage B alongside — not instead of — the passive check.
 
 ### C. Halt firmware on health-check failure
@@ -172,12 +205,14 @@ invalidate.
 - The system can boot without any VESC attached (bench test) — it
   stays disarmed, the bus is clocked with ERPM=0 frames, and the
   micro-ROS topics are publishable.
-- Each VESC must be configured in VESC Tool to broadcast `STATUS`
-  and `STATUS_4` (default VESC Tool behavior). If status broadcasts
-  are disabled, Stage A fails; Stage B (ping) becomes mandatory.
-- The `vesc_health_t` struct is available to `uros_task` for
-  publishing a diagnostics topic; the actual publication is
-  out of scope for this ADR.
+- Each VESC must be configured in VESC Tool to broadcast
+  `STATUS` and `STATUS_5` (enum value `STATUS_1_2_3_4_5` or
+  `STATUS_1_2_3_4_5_6` under *App Settings → General → Send CAN
+  status*). If status broadcasts are disabled, Stage A fails;
+  Stage B (ping) stays authoritative for liveness but voltage
+  plausibility is lost.
+- `vesc_health_t` is published over micro-ROS via
+  `/vesc/{left,right}/battery` (see “Host visibility” above).
 - Stages B and C require new protocol paths in `vesc_can.c` but
   no hardware changes.
 
@@ -186,4 +221,6 @@ invalidate.
 - ADR-0003 — VESC CAN protocol (frame formats, controller IDs).
 - ADR-0006 — RC failsafe & mixing (`FAILSAFE_STOP` semantics reused).
 - ADR-0007 — CAN bus topology (termination, bitrate).
-- VESC bldc firmware, `comm_can.c` (ping/pong, STATUS/STATUS_4/STATUS_6).
+- VESC bldc firmware, `comm_can.c` (ping/pong, STATUS_1–5).
+- REP 144 — ROS topic and service name conventions (digit-leading
+  segments rejected; drove `/vesc/{left,right}/battery` naming).
