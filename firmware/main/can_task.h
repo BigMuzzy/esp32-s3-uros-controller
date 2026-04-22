@@ -41,6 +41,39 @@ extern "C" {
 
 /* VESC_ID_LEFT / VESC_ID_RIGHT are defined in vesc_can.h (included above). */
 
+/* ── Health-check configuration (ADR-0009) ───────────────────────── */
+
+/* Max time to wait at boot for both VESCs to broadcast STATUS + STATUS_4. */
+#define VESC_HEALTH_BOOT_TIMEOUT_MS   1500
+
+/* Plausibility window for VESC input voltage (volts). Values outside
+ * this range at boot mark the VESC unhealthy. Tune for the target pack. */
+#define VESC_VOLTAGE_MIN_V            18.0f
+#define VESC_VOLTAGE_MAX_V            60.0f
+
+/* ── Types ───────────────────────────────────────────────────────── */
+
+/**
+ * Per-VESC health snapshot.  Populated by can_rx_task, read by any core.
+ *
+ * Fields reflect the most recent observed state:
+ *   online         — set once boot-time presence check passes.  Cleared
+ *                    by the runtime watchdog when status stops arriving
+ *                    (Stage C, not yet implemented).
+ *   voltage_in     — last decoded STATUS_4 input voltage (volts).  0 if
+ *                    no STATUS_4 has been received yet.
+ *   fault_code     — reserved for STATUS_6 decode (Stage B/C).  Always 0
+ *                    at present.
+ *   last_status_ms — esp_timer-based timestamp (ms) of the last STATUS
+ *                    frame from this VESC.  0 if never seen.
+ */
+typedef struct {
+    bool     online;
+    float    voltage_in;
+    uint8_t  fault_code;
+    uint32_t last_status_ms;
+} vesc_health_t;
+
 /* ── Initialization ──────────────────────────────────────────────── */
 
 /**
@@ -83,6 +116,16 @@ void can_task_get_odom(odom_state_t *odom_out);
  * @return true if status has been received at least once.
  */
 bool can_task_get_vesc_status(uint8_t vesc_id, vesc_status_t *status_out);
+
+/**
+ * Read the latest health snapshot for a given VESC ID.
+ * Thread-safe (spinlock).
+ *
+ * @param vesc_id     VESC_ID_LEFT or VESC_ID_RIGHT.
+ * @param health_out  Populated with the latest health state.
+ * @return true if vesc_id is valid; false otherwise.
+ */
+bool can_task_get_vesc_health(uint8_t vesc_id, vesc_health_t *health_out);
 
 #ifdef __cplusplus
 }

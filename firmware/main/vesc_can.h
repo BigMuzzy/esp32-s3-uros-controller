@@ -11,9 +11,13 @@
  *   ID[7:0]  = VESC controller ID
  *
  * Supported commands:
- *   TX: CAN_PACKET_SET_RPM  (cmd 3) — ERPM set-point, 4-byte big-endian
- *   RX: CAN_PACKET_STATUS   (cmd 9) — ERPM, current, duty
- *   RX: CAN_PACKET_STATUS_4 (cmd 14) — tachometer (cumulative ERPM ticks), voltage
+ *   TX: CAN_PACKET_SET_RPM  (cmd 3)  — ERPM set-point, 4-byte big-endian
+ *   RX: CAN_PACKET_STATUS   (cmd 9)  — ERPM, current, duty
+ *   RX: CAN_PACKET_STATUS_5 (cmd 27) — tachometer (cumulative ERPM ticks), v_in
+ *
+ * Note: STATUS_2/3/4 (cmd 14/15/16) carry amp-hours, watt-hours, and
+ * temperatures respectively — not used here. Do not confuse STATUS_4
+ * with STATUS_5; only STATUS_5 contains tachometer + voltage.
  *
  * Requires TWAI driver to be initialized separately (see can_task.h).
  */
@@ -37,7 +41,7 @@ extern "C" {
 
 #define VESC_CAN_CMD_SET_RPM    3
 #define VESC_CAN_CMD_STATUS     9
-#define VESC_CAN_CMD_STATUS_4  14
+#define VESC_CAN_CMD_STATUS_5  27
 
 /* ── Status data ─────────────────────────────────────────────────── */
 
@@ -52,13 +56,13 @@ typedef struct {
 } vesc_status_t;
 
 /**
- * Decoded fields from CAN_PACKET_STATUS_4 (cmd 14).
+ * Decoded fields from CAN_PACKET_STATUS_5 (cmd 27).
  * Used for odometry (tachometer) and battery monitoring (voltage).
  */
 typedef struct {
     int32_t tachometer;    /* cumulative ERPM ticks (signed) */
     float   voltage_in;    /* input voltage, volts            */
-} vesc_status4_t;
+} vesc_status5_t;
 
 /* ── TX: command encoding ────────────────────────────────────────── */
 
@@ -94,13 +98,13 @@ int vesc_can_get_cmd(const twai_message_t *msg, uint8_t *vesc_id);
 bool vesc_can_decode_status(const twai_message_t *msg, vesc_status_t *out);
 
 /**
- * Decode CAN_PACKET_STATUS_4 (cmd 14) from a received TWAI message.
+ * Decode CAN_PACKET_STATUS_5 (cmd 27) from a received TWAI message.
  *
- * @param msg  Received message (caller should verify cmd == VESC_CAN_CMD_STATUS_4).
+ * @param msg  Received message (caller should verify cmd == VESC_CAN_CMD_STATUS_5).
  * @param out  Decoded status fields.
  * @return     true on success, false if DLC is wrong.
  */
-bool vesc_can_decode_status4(const twai_message_t *msg, vesc_status4_t *out);
+bool vesc_can_decode_status5(const twai_message_t *msg, vesc_status5_t *out);
 
 #ifdef __cplusplus
 }

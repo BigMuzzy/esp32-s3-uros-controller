@@ -77,12 +77,12 @@ bool vesc_can_decode_status(const twai_message_t *msg, vesc_status_t *out)
 }
 
 /*
- * CAN_PACKET_STATUS_4 (cmd 14), 8 bytes:
+ * CAN_PACKET_STATUS_5 (cmd 27), 8 bytes:
  *   [0:3] tachometer    — int32, big-endian (cumulative ERPM ticks)
  *   [4:5] voltage × 10  — int16, big-endian (volts × 10)
  *   [6:7] reserved
  */
-bool vesc_can_decode_status4(const twai_message_t *msg, vesc_status4_t *out)
+bool vesc_can_decode_status5(const twai_message_t *msg, vesc_status5_t *out)
 {
     if (msg->data_length_code < 6) {
         return false;

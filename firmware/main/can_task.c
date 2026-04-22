@@ -11,8 +11,10 @@
 #include "can_task.h"
 #include "rc_failsafe.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 
 #include <inttypes.h>
 #include <string.h>
@@ -34,8 +36,23 @@ static odom_state_t   s_odom;
 
 static portMUX_TYPE   s_status_mux = portMUX_INITIALIZER_UNLOCKED;
 static vesc_status_t  s_vesc_status[2]; /* [0]=left, [1]=right */
-static vesc_status4_t s_vesc_status4[2];
+static vesc_status5_t s_vesc_status5[2];
 static bool           s_status_valid[2];
+static vesc_health_t  s_vesc_health[2];
+
+/* Event group used during boot health check and for runtime arming.
+ * Bits 0/1: STATUS   seen from LEFT/RIGHT.
+ * Bits 2/3: STATUS_5 seen from LEFT/RIGHT.
+ * Bit  7:   BIT_ARMED — can_tx_task allowed to command non-zero ERPM. */
+#define BIT_STATUS_LEFT    (1 << 0)
+#define BIT_STATUS_RIGHT   (1 << 1)
+#define BIT_STATUS5_LEFT   (1 << 2)
+#define BIT_STATUS5_RIGHT  (1 << 3)
+#define BIT_ALL_SEEN       (BIT_STATUS_LEFT | BIT_STATUS_RIGHT | \
+                            BIT_STATUS5_LEFT | BIT_STATUS5_RIGHT)
+#define BIT_ARMED          (1 << 7)
+
+static EventGroupHandle_t s_can_events;
 
 /* ── Odometry state (Core 1 only) ────────────────────────────────── */
 
@@ -58,27 +75,35 @@ static void can_tx_task(void *arg)
     for (;;) {
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(CAN_TX_PERIOD_MS));
 
+        /* Hard gate: until the boot-time health check arms the system,
+         * only transmit ERPM=0.  This keeps the bus active (so VESCs
+         * that require periodic commands don't time out) while making
+         * sure we never command motion against an unhealthy VESC. */
+        bool armed = (xEventGroupGetBits(s_can_events) & BIT_ARMED) != 0;
+
         drive_mode_t mode = rc_failsafe_get_mode();
         wheel_erpm_t erpm = { .left_erpm = 0, .right_erpm = 0 };
 
-        switch (mode) {
-        case DRIVE_MODE_AUTONOMOUS: {
-            cmd_vel_t cmd;
-            taskENTER_CRITICAL(&s_cmd_vel_mux);
-            cmd = s_cmd_vel;
-            taskEXIT_CRITICAL(&s_cmd_vel_mux);
-            erpm = diff_drive_cmd_vel_to_erpm(&cmd);
-            break;
-        }
-        case DRIVE_MODE_MANUAL: {
-            rc_input_t rc = rc_failsafe_read();
-            cmd_vel_t cmd = rc_failsafe_arcade_mix(&rc);
-            erpm = diff_drive_cmd_vel_to_erpm(&cmd);
-            break;
-        }
-        case DRIVE_MODE_FAILSAFE_STOP:
-            /* erpm already zeroed */
-            break;
+        if (armed) {
+            switch (mode) {
+            case DRIVE_MODE_AUTONOMOUS: {
+                cmd_vel_t cmd;
+                taskENTER_CRITICAL(&s_cmd_vel_mux);
+                cmd = s_cmd_vel;
+                taskEXIT_CRITICAL(&s_cmd_vel_mux);
+                erpm = diff_drive_cmd_vel_to_erpm(&cmd);
+                break;
+            }
+            case DRIVE_MODE_MANUAL: {
+                rc_input_t rc = rc_failsafe_read();
+                cmd_vel_t cmd = rc_failsafe_arcade_mix(&rc);
+                erpm = diff_drive_cmd_vel_to_erpm(&cmd);
+                break;
+            }
+            case DRIVE_MODE_FAILSAFE_STOP:
+                /* erpm already zeroed */
+                break;
+            }
         }
 
         /* Send ERPM commands to both VESCs. Log TX failures at most
@@ -132,10 +157,15 @@ static void can_rx_task(void *arg)
         case VESC_CAN_CMD_STATUS: {
             vesc_status_t st;
             if (vesc_can_decode_status(&msg, &st)) {
+                uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
                 taskENTER_CRITICAL(&s_status_mux);
                 s_vesc_status[idx] = st;
                 s_status_valid[idx] = true;
+                s_vesc_health[idx].last_status_ms = now_ms;
                 taskEXIT_CRITICAL(&s_status_mux);
+
+                xEventGroupSetBits(s_can_events,
+                    (idx == 0) ? BIT_STATUS_LEFT : BIT_STATUS_RIGHT);
 
                 /* Cache ERPM for odom velocity */
                 if (idx == 0) s_erpm_left  = st.erpm;
@@ -143,19 +173,23 @@ static void can_rx_task(void *arg)
             }
             break;
         }
-        case VESC_CAN_CMD_STATUS_4: {
-            vesc_status4_t st4;
-            if (vesc_can_decode_status4(&msg, &st4)) {
+        case VESC_CAN_CMD_STATUS_5: {
+            vesc_status5_t st5;
+            if (vesc_can_decode_status5(&msg, &st5)) {
                 taskENTER_CRITICAL(&s_status_mux);
-                s_vesc_status4[idx] = st4;
+                s_vesc_status5[idx] = st5;
+                s_vesc_health[idx].voltage_in = st5.voltage_in;
                 taskEXIT_CRITICAL(&s_status_mux);
+
+                xEventGroupSetBits(s_can_events,
+                    (idx == 0) ? BIT_STATUS5_LEFT : BIT_STATUS5_RIGHT);
 
                 /* Track tachometer updates for odometry */
                 if (idx == 0) {
-                    s_tach_left = st4.tachometer;
+                    s_tach_left = st5.tachometer;
                     s_tach_left_updated = true;
                 } else {
-                    s_tach_right = st4.tachometer;
+                    s_tach_right = st5.tachometer;
                     s_tach_right_updated = true;
                 }
 
@@ -183,11 +217,83 @@ static void can_rx_task(void *arg)
 
 /* ── Initialization ──────────────────────────────────────────────── */
 
+/* Wait for both VESCs to report STATUS + STATUS_5, verify voltage,
+ * then set BIT_ARMED.  On failure, logs which VESC is missing or out
+ * of range but returns ESP_OK anyway — the system stays up in a safe
+ * (non-armed) state so diagnostics remain publishable.  See ADR-0009. */
+static void vesc_boot_health_check(void)
+{
+    ESP_LOGI(TAG, "VESC boot health check (timeout %d ms)...",
+             VESC_HEALTH_BOOT_TIMEOUT_MS);
+
+    EventBits_t bits = xEventGroupWaitBits(
+        s_can_events, BIT_ALL_SEEN,
+        pdFALSE,   /* don't clear on exit */
+        pdTRUE,    /* wait for all bits   */
+        pdMS_TO_TICKS(VESC_HEALTH_BOOT_TIMEOUT_MS));
+
+    const uint8_t ids[2] = { VESC_ID_LEFT, VESC_ID_RIGHT };
+    const EventBits_t want_status[2]  = { BIT_STATUS_LEFT,  BIT_STATUS_RIGHT };
+    const EventBits_t want_status5[2] = { BIT_STATUS5_LEFT, BIT_STATUS5_RIGHT };
+
+    bool all_ok = true;
+    for (int i = 0; i < 2; i++) {
+        bool saw_status  = (bits & want_status[i])  != 0;
+        bool saw_status5 = (bits & want_status5[i]) != 0;
+
+        float v = 0.0f;
+        taskENTER_CRITICAL(&s_status_mux);
+        v = s_vesc_health[i].voltage_in;
+        taskEXIT_CRITICAL(&s_status_mux);
+
+        bool voltage_ok = saw_status5 &&
+                          v >= VESC_VOLTAGE_MIN_V &&
+                          v <= VESC_VOLTAGE_MAX_V;
+
+        bool ok = saw_status && saw_status5 && voltage_ok;
+        if (ok) {
+            ESP_LOGI(TAG, "VESC %u: online, V_in=%.1f V", ids[i], v);
+        } else if (!saw_status && !saw_status5) {
+            ESP_LOGW(TAG, "VESC %u: no status frames received", ids[i]);
+        } else if (!voltage_ok && saw_status5) {
+            ESP_LOGW(TAG, "VESC %u: voltage %.1f V out of range [%.1f, %.1f]",
+                     ids[i], v, VESC_VOLTAGE_MIN_V, VESC_VOLTAGE_MAX_V);
+        } else {
+            ESP_LOGW(TAG, "VESC %u: partial status (STATUS=%d STATUS_5=%d)",
+                     ids[i], saw_status, saw_status5);
+        }
+
+        taskENTER_CRITICAL(&s_status_mux);
+        s_vesc_health[i].online = ok;
+        taskEXIT_CRITICAL(&s_status_mux);
+
+        if (!ok) all_ok = false;
+    }
+
+    if (all_ok) {
+        xEventGroupSetBits(s_can_events, BIT_ARMED);
+        ESP_LOGI(TAG, "VESC health check passed; motor commands armed");
+    } else {
+        ESP_LOGE(TAG, "VESC health check failed; motor commands disarmed "
+                      "(ERPM=0 will be transmitted). Fix wiring/config "
+                      "and reboot.");
+    }
+}
+
 esp_err_t can_task_init(void)
 {
-    /* Configure TWAI: 500 kbit/s, extended frames */
+    s_can_events = xEventGroupCreate();
+    if (s_can_events == NULL) {
+        ESP_LOGE(TAG, "EventGroup alloc failed");
+        return ESP_ERR_NO_MEM;
+    }
+
+    /* Configure TWAI: 500 kbit/s, extended frames, bus-health alerts. */
     twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
         CAN_TX_GPIO, CAN_RX_GPIO, TWAI_MODE_NORMAL);
+    g_config.alerts_enabled = TWAI_ALERT_BUS_ERROR | TWAI_ALERT_BUS_OFF |
+                              TWAI_ALERT_ERR_PASS  | TWAI_ALERT_TX_FAILED |
+                              TWAI_ALERT_RX_QUEUE_FULL;
     twai_timing_config_t t_config = TWAI_TIMING_CONFIG_500KBITS();
     twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
@@ -206,14 +312,18 @@ esp_err_t can_task_init(void)
     ESP_LOGI(TAG, "TWAI started (500 kbit/s, TX=%d, RX=%d)",
              CAN_TX_GPIO, CAN_RX_GPIO);
 
-    /* Create tasks pinned to Core 1 */
+    /* Start RX first so the health check can observe VESC broadcasts. */
     BaseType_t ok;
-    ok = xTaskCreatePinnedToCore(can_tx_task, "can_tx",
-             CAN_TX_TASK_STACK, NULL, CAN_TX_TASK_PRIO, NULL, 1);
-    if (ok != pdPASS) return ESP_FAIL;
-
     ok = xTaskCreatePinnedToCore(can_rx_task, "can_rx",
              CAN_RX_TASK_STACK, NULL, CAN_RX_TASK_PRIO, NULL, 1);
+    if (ok != pdPASS) return ESP_FAIL;
+
+    /* Boot-time passive presence + voltage check (ADR-0009 Stage A). */
+    vesc_boot_health_check();
+
+    /* TX task always runs — gated internally by BIT_ARMED. */
+    ok = xTaskCreatePinnedToCore(can_tx_task, "can_tx",
+             CAN_TX_TASK_STACK, NULL, CAN_TX_TASK_PRIO, NULL, 1);
     if (ok != pdPASS) return ESP_FAIL;
 
     return ESP_OK;
@@ -250,4 +360,18 @@ bool can_task_get_vesc_status(uint8_t vesc_id, vesc_status_t *status_out)
     taskEXIT_CRITICAL(&s_status_mux);
 
     return valid;
+}
+
+bool can_task_get_vesc_health(uint8_t vesc_id, vesc_health_t *health_out)
+{
+    int idx = -1;
+    if (vesc_id == VESC_ID_LEFT)  idx = 0;
+    if (vesc_id == VESC_ID_RIGHT) idx = 1;
+    if (idx < 0) return false;
+
+    taskENTER_CRITICAL(&s_status_mux);
+    *health_out = s_vesc_health[idx];
+    taskEXIT_CRITICAL(&s_status_mux);
+
+    return true;
 }
