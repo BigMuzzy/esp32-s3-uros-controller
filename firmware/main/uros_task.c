@@ -29,6 +29,7 @@
 
 #include <geometry_msgs/msg/twist.h>
 #include <nav_msgs/msg/odometry.h>
+#include <sensor_msgs/msg/battery_state.h>
 #include <std_msgs/msg/bool.h>
 
 #include <rmw_microxrcedds_c/config.h>
@@ -63,6 +64,7 @@ static void yaw_to_quaternion(float yaw,
 static geometry_msgs__msg__Twist  s_cmd_vel_msg;
 static nav_msgs__msg__Odometry    s_odom_msg;
 static std_msgs__msg__Bool        s_failsafe_msg;
+static sensor_msgs__msg__BatteryState s_battery_msg[2]; /* [0]=LEFT, [1]=RIGHT */
 
 /* ── cmd_vel subscription callback ───────────────────────────────── */
 
@@ -108,6 +110,31 @@ static void publish_failsafe(rcl_publisher_t *pub)
     rcl_publish(pub, &s_failsafe_msg, NULL);
 }
 
+/* Per-VESC health → sensor_msgs/BatteryState.
+ * We populate the fields that have meaningful VESC mappings and leave
+ * the rest at NaN (the documented convention for "not measured"). */
+static void publish_battery(rcl_publisher_t *pub, uint8_t vesc_id, int idx)
+{
+    vesc_health_t h;
+    if (!can_task_get_vesc_health(vesc_id, &h)) return;
+
+    sensor_msgs__msg__BatteryState *m = &s_battery_msg[idx];
+    m->voltage  = h.voltage_in;
+    m->present  = h.online;
+    /* Not measured by VESC protocol at this layer: */
+    m->temperature   = NAN;
+    m->current       = NAN;
+    m->charge        = NAN;
+    m->capacity      = NAN;
+    m->design_capacity = NAN;
+    m->percentage    = NAN;
+    m->power_supply_status     = 0; /* UNKNOWN */
+    m->power_supply_health     = 0; /* UNKNOWN */
+    m->power_supply_technology = 0; /* UNKNOWN */
+
+    rcl_publish(pub, m, NULL);
+}
+
 /* ── Main task ───────────────────────────────────────────────────── */
 
 static void uros_task_fn(void *arg)
@@ -144,12 +171,32 @@ static void uros_task_fn(void *arg)
 
         /* ── Publishers ─────────────────────────────────────────── */
         rcl_publisher_t odom_pub;
-        rclc_publisher_init_default(&odom_pub, &node,
+        rc = rclc_publisher_init_default(&odom_pub, &node,
             ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry), "odom");
+        if (rc != RCL_RET_OK) {
+            ESP_LOGE(TAG, "odom publisher init failed: %d", (int)rc);
+        }
 
         rcl_publisher_t failsafe_pub;
-        rclc_publisher_init_default(&failsafe_pub, &node,
+        rc = rclc_publisher_init_default(&failsafe_pub, &node,
             ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool), "failsafe/active");
+        if (rc != RCL_RET_OK) {
+            ESP_LOGE(TAG, "failsafe publisher init failed: %d", (int)rc);
+        }
+
+        rcl_publisher_t battery_pub[2];
+        rc = rclc_publisher_init_default(&battery_pub[0], &node,
+            ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, BatteryState),
+            "vesc/left/battery");
+        if (rc != RCL_RET_OK) {
+            ESP_LOGE(TAG, "vesc/left/battery publisher init failed: %d", (int)rc);
+        }
+        rc = rclc_publisher_init_default(&battery_pub[1], &node,
+            ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, BatteryState),
+            "vesc/right/battery");
+        if (rc != RCL_RET_OK) {
+            ESP_LOGE(TAG, "vesc/right/battery publisher init failed: %d", (int)rc);
+        }
 
         /* ── Subscription ───────────────────────────────────────── */
         rcl_subscription_t cmd_vel_sub;
@@ -182,6 +229,8 @@ static void uros_task_fn(void *arg)
                                      RCL_MS_TO_NS(UROS_SPIN_PERIOD_MS));
             publish_odom(&odom_pub);
             publish_failsafe(&failsafe_pub);
+            publish_battery(&battery_pub[0], VESC_ID_LEFT,  0);
+            publish_battery(&battery_pub[1], VESC_ID_RIGHT, 1);
         }
 
         /* ── Agent lost — cleanup ───────────────────────────────── */
@@ -189,6 +238,8 @@ static void uros_task_fn(void *arg)
 
         rclc_executor_fini(&executor);
         rcl_subscription_fini(&cmd_vel_sub, &node);
+        rcl_publisher_fini(&battery_pub[1], &node);
+        rcl_publisher_fini(&battery_pub[0], &node);
         rcl_publisher_fini(&failsafe_pub, &node);
         rcl_publisher_fini(&odom_pub, &node);
         rcl_node_fini(&node);

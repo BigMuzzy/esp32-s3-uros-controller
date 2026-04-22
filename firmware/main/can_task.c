@@ -84,31 +84,42 @@ static bool vesc_watchdog_check(uint32_t now_ms)
     for (int i = 0; i < 2; i++) {
         uint32_t last_ms;
         bool boot_online;
+        float   voltage;
         taskENTER_CRITICAL(&s_status_mux);
         last_ms     = s_vesc_health[i].last_status_ms;
         boot_online = s_vesc_health[i].online;
+        voltage     = s_vesc_health[i].voltage_in;
         taskEXIT_CRITICAL(&s_status_mux);
 
-        /* Only considered online if (a) boot check passed and
-         * (b) a STATUS frame arrived within the timeout window. */
+        /* Only considered online if (a) boot check passed,
+         * (b) a STATUS frame arrived within the timeout window, and
+         * (c) last reported V_in is inside the plausibility window. */
         bool fresh = (last_ms != 0) &&
                      ((now_ms - last_ms) <= VESC_STATUS_TIMEOUT_MS);
-        bool online = boot_online && fresh;
+        bool voltage_ok = (voltage >= VESC_VOLTAGE_MIN_V) &&
+                          (voltage <= VESC_VOLTAGE_MAX_V);
+        bool online = boot_online && fresh && voltage_ok;
 
         if (online != s_was_online[i]) {
             if (online) {
-                ESP_LOGW(TAG, "VESC %u: status recovered", ids[i]);
-            } else {
+                ESP_LOGW(TAG, "VESC %u: healthy again (V_in=%.1f V)",
+                         ids[i], voltage);
+            } else if (!fresh) {
                 ESP_LOGE(TAG, "VESC %u: status timeout (last %" PRIu32
                               " ms ago) — forcing stop",
                          ids[i], now_ms - last_ms);
+            } else {
+                ESP_LOGE(TAG, "VESC %u: voltage %.1f V out of range "
+                              "[%.1f, %.1f] — forcing stop",
+                         ids[i], voltage,
+                         VESC_VOLTAGE_MIN_V, VESC_VOLTAGE_MAX_V);
             }
             s_was_online[i] = online;
 
-            /* Publish the runtime state so /vesc/health (when added)
-             * reflects the watchdog verdict, not just the boot result.
-             * Note: boot-time `online = false` is sticky — runtime
-             * watchdog only downgrades a previously-armed VESC. */
+            /* Publish the runtime state so /vesc/health reflects the
+             * watchdog verdict, not just the boot result.  Boot-time
+             * `online = false` is sticky — runtime watchdog only
+             * downgrades a previously-armed VESC. */
             taskENTER_CRITICAL(&s_status_mux);
             if (boot_online) {
                 s_vesc_health[i].online = online;
