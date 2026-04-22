@@ -48,6 +48,16 @@ void vesc_can_encode_rpm(uint8_t vesc_id, int32_t erpm,
     put_be32(out_msg->data, erpm);
 }
 
+void vesc_can_encode_ping(uint8_t target_vesc_id, uint8_t sender_id,
+                          twai_message_t *out_msg)
+{
+    memset(out_msg, 0, sizeof(*out_msg));
+    out_msg->extd = 1;
+    out_msg->identifier = ((uint32_t)VESC_CAN_CMD_PING << 8) | target_vesc_id;
+    out_msg->data_length_code = 1;
+    out_msg->data[0] = sender_id;
+}
+
 /* ── RX: status decoding ─────────────────────────────────────────── */
 
 int vesc_can_get_cmd(const twai_message_t *msg, uint8_t *vesc_id)
@@ -89,5 +99,14 @@ bool vesc_can_decode_status5(const twai_message_t *msg, vesc_status5_t *out)
     }
     out->tachometer = get_be32(msg->data);
     out->voltage_in = (float)get_be16(msg->data + 4) / 10.0f;
+    return true;
+}
+
+bool vesc_can_decode_pong(const twai_message_t *msg, uint8_t *responder_id)
+{
+    if (msg->data_length_code < 1) {
+        return false;
+    }
+    *responder_id = msg->data[0];
     return true;
 }

@@ -41,7 +41,15 @@ extern "C" {
 
 #define VESC_CAN_CMD_SET_RPM    3
 #define VESC_CAN_CMD_STATUS     9
+#define VESC_CAN_CMD_PING      17
+#define VESC_CAN_CMD_PONG      18
 #define VESC_CAN_CMD_STATUS_5  27
+
+/* Sender ID used by this ESP32 in ping requests.  Must not collide
+ * with any VESC_ID_* on the bus.  VESC firmware treats IDs 0..253
+ * as regular controllers; 0xFE is a conventional "external tool"
+ * sender ID matching VESC Tool defaults. */
+#define VESC_CAN_SENDER_ID   0xFE
 
 /* ── Status data ─────────────────────────────────────────────────── */
 
@@ -77,6 +85,19 @@ typedef struct {
 void vesc_can_encode_rpm(uint8_t vesc_id, int32_t erpm,
                          twai_message_t *out_msg);
 
+/**
+ * Build a TWAI message that pings a VESC.  The target VESC replies
+ * with a PONG addressed to `sender_id`, payload = [target_vesc_id].
+ *
+ * @param target_vesc_id  VESC to ping.
+ * @param sender_id       Our controller ID; the VESC sends the PONG
+ *                        to (PONG << 8) | sender_id.
+ *                        Normally VESC_CAN_SENDER_ID.
+ * @param out_msg         Filled with the ready-to-transmit message.
+ */
+void vesc_can_encode_ping(uint8_t target_vesc_id, uint8_t sender_id,
+                          twai_message_t *out_msg);
+
 /* ── RX: status decoding ────────────────────────────────────────── */
 
 /**
@@ -105,6 +126,19 @@ bool vesc_can_decode_status(const twai_message_t *msg, vesc_status_t *out);
  * @return     true on success, false if DLC is wrong.
  */
 bool vesc_can_decode_status5(const twai_message_t *msg, vesc_status5_t *out);
+
+/**
+ * Decode CAN_PACKET_PONG.  The payload carries the responding VESC's
+ * controller ID.  Caller should verify cmd == VESC_CAN_CMD_PONG and
+ * that the lower 8 bits of the frame ID match our sender ID before
+ * calling.
+ *
+ * @param msg            Received PONG frame (DLC must be >= 1).
+ * @param responder_id   Populated with payload[0] — the VESC that
+ *                       answered the ping.
+ * @return               true on success, false if DLC is wrong.
+ */
+bool vesc_can_decode_pong(const twai_message_t *msg, uint8_t *responder_id);
 
 #ifdef __cplusplus
 }

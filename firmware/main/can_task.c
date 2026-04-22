@@ -43,13 +43,17 @@ static vesc_health_t  s_vesc_health[2];
 /* Event group used during boot health check and for runtime arming.
  * Bits 0/1: STATUS   seen from LEFT/RIGHT.
  * Bits 2/3: STATUS_5 seen from LEFT/RIGHT.
+ * Bits 4/5: PONG     seen from LEFT/RIGHT.
  * Bit  7:   BIT_ARMED — can_tx_task allowed to command non-zero ERPM. */
 #define BIT_STATUS_LEFT    (1 << 0)
 #define BIT_STATUS_RIGHT   (1 << 1)
 #define BIT_STATUS5_LEFT   (1 << 2)
 #define BIT_STATUS5_RIGHT  (1 << 3)
+#define BIT_PONG_LEFT      (1 << 4)
+#define BIT_PONG_RIGHT     (1 << 5)
 #define BIT_ALL_SEEN       (BIT_STATUS_LEFT | BIT_STATUS_RIGHT | \
                             BIT_STATUS5_LEFT | BIT_STATUS5_RIGHT)
+#define BIT_ALL_PONG       (BIT_PONG_LEFT | BIT_PONG_RIGHT)
 #define BIT_ARMED          (1 << 7)
 
 static EventGroupHandle_t s_can_events;
@@ -148,6 +152,21 @@ static void can_rx_task(void *arg)
         int cmd = vesc_can_get_cmd(&msg, &vesc_id);
         if (cmd < 0) continue;
 
+        /* PONG arrives addressed to our sender ID; the responding
+         * VESC's ID is in the payload, not the frame ID. Handle
+         * before the VESC_ID_* filter below. */
+        if (cmd == VESC_CAN_CMD_PONG && vesc_id == VESC_CAN_SENDER_ID) {
+            uint8_t responder;
+            if (vesc_can_decode_pong(&msg, &responder)) {
+                if (responder == VESC_ID_LEFT) {
+                    xEventGroupSetBits(s_can_events, BIT_PONG_LEFT);
+                } else if (responder == VESC_ID_RIGHT) {
+                    xEventGroupSetBits(s_can_events, BIT_PONG_RIGHT);
+                }
+            }
+            continue;
+        }
+
         int idx = -1;
         if (vesc_id == VESC_ID_LEFT)  idx = 0;
         if (vesc_id == VESC_ID_RIGHT) idx = 1;
@@ -217,13 +236,50 @@ static void can_rx_task(void *arg)
 
 /* ── Initialization ──────────────────────────────────────────────── */
 
-/* Wait for both VESCs to report STATUS + STATUS_5, verify voltage,
- * then set BIT_ARMED.  On failure, logs which VESC is missing or out
- * of range but returns ESP_OK anyway — the system stays up in a safe
- * (non-armed) state so diagnostics remain publishable.  See ADR-0009. */
+/* Send a single PING to each VESC and wait for both PONGs, up to
+ * VESC_PING_TIMEOUT_MS. Returns the event-group bits actually seen so
+ * the caller can report per-VESC results. */
+static EventBits_t vesc_ping_round(void)
+{
+    twai_message_t msg;
+
+    xEventGroupClearBits(s_can_events, BIT_ALL_PONG);
+
+    vesc_can_encode_ping(VESC_ID_LEFT,  VESC_CAN_SENDER_ID, &msg);
+    (void)twai_transmit(&msg, pdMS_TO_TICKS(5));
+
+    vesc_can_encode_ping(VESC_ID_RIGHT, VESC_CAN_SENDER_ID, &msg);
+    (void)twai_transmit(&msg, pdMS_TO_TICKS(5));
+
+    return xEventGroupWaitBits(s_can_events, BIT_ALL_PONG,
+        pdFALSE, pdTRUE, pdMS_TO_TICKS(VESC_PING_TIMEOUT_MS));
+}
+
+/* Boot-time health check (ADR-0009 Stages A + B).
+ *   1. Active ping/pong: authoritative liveness, independent of the
+ *      VESC being configured to broadcast periodic status.
+ *   2. Passive STATUS + STATUS_5 wait: confirms the VESC is actually
+ *      producing the frames odometry needs, and provides voltage for
+ *      the plausibility check.
+ * Both must pass per VESC to set BIT_ARMED. On failure, logs which
+ * check failed but returns normally — the system stays up disarmed
+ * so diagnostics remain publishable. */
 static void vesc_boot_health_check(void)
 {
-    ESP_LOGI(TAG, "VESC boot health check (timeout %d ms)...",
+    /* ── Stage B: active ping ─────────────────────────────────── */
+
+    ESP_LOGI(TAG, "VESC boot ping (timeout %d ms, %d retries)...",
+             VESC_PING_TIMEOUT_MS, VESC_PING_RETRIES);
+
+    EventBits_t pong_bits = 0;
+    for (int attempt = 0; attempt <= VESC_PING_RETRIES; attempt++) {
+        pong_bits = vesc_ping_round();
+        if ((pong_bits & BIT_ALL_PONG) == BIT_ALL_PONG) break;
+    }
+
+    /* ── Stage A: passive status wait ─────────────────────────── */
+
+    ESP_LOGI(TAG, "VESC boot status wait (timeout %d ms)...",
              VESC_HEALTH_BOOT_TIMEOUT_MS);
 
     EventBits_t bits = xEventGroupWaitBits(
@@ -232,14 +288,18 @@ static void vesc_boot_health_check(void)
         pdTRUE,    /* wait for all bits   */
         pdMS_TO_TICKS(VESC_HEALTH_BOOT_TIMEOUT_MS));
 
+    /* ── Per-VESC verdict ─────────────────────────────────────── */
+
     const uint8_t ids[2] = { VESC_ID_LEFT, VESC_ID_RIGHT };
+    const EventBits_t want_pong[2]    = { BIT_PONG_LEFT,    BIT_PONG_RIGHT };
     const EventBits_t want_status[2]  = { BIT_STATUS_LEFT,  BIT_STATUS_RIGHT };
     const EventBits_t want_status5[2] = { BIT_STATUS5_LEFT, BIT_STATUS5_RIGHT };
 
     bool all_ok = true;
     for (int i = 0; i < 2; i++) {
-        bool saw_status  = (bits & want_status[i])  != 0;
-        bool saw_status5 = (bits & want_status5[i]) != 0;
+        bool saw_pong    = (pong_bits & want_pong[i])    != 0;
+        bool saw_status  = (bits      & want_status[i])  != 0;
+        bool saw_status5 = (bits      & want_status5[i]) != 0;
 
         float v = 0.0f;
         taskENTER_CRITICAL(&s_status_mux);
@@ -250,17 +310,23 @@ static void vesc_boot_health_check(void)
                           v >= VESC_VOLTAGE_MIN_V &&
                           v <= VESC_VOLTAGE_MAX_V;
 
-        bool ok = saw_status && saw_status5 && voltage_ok;
+        bool ok = saw_pong && saw_status && saw_status5 && voltage_ok;
         if (ok) {
-            ESP_LOGI(TAG, "VESC %u: online, V_in=%.1f V", ids[i], v);
+            ESP_LOGI(TAG, "VESC %u: online (PONG ok), V_in=%.1f V",
+                     ids[i], v);
+        } else if (!saw_pong) {
+            ESP_LOGW(TAG, "VESC %u: no PONG — not reachable on bus",
+                     ids[i]);
         } else if (!saw_status && !saw_status5) {
-            ESP_LOGW(TAG, "VESC %u: no status frames received", ids[i]);
+            ESP_LOGW(TAG, "VESC %u: PONG ok but no STATUS broadcasts — "
+                          "enable 'Send CAN status = STATUS_1_2_3_4_5' in VESC Tool",
+                     ids[i]);
         } else if (!voltage_ok && saw_status5) {
             ESP_LOGW(TAG, "VESC %u: voltage %.1f V out of range [%.1f, %.1f]",
                      ids[i], v, VESC_VOLTAGE_MIN_V, VESC_VOLTAGE_MAX_V);
         } else {
-            ESP_LOGW(TAG, "VESC %u: partial status (STATUS=%d STATUS_5=%d)",
-                     ids[i], saw_status, saw_status5);
+            ESP_LOGW(TAG, "VESC %u: partial status (PONG=%d STATUS=%d STATUS_5=%d)",
+                     ids[i], saw_pong, saw_status, saw_status5);
         }
 
         taskENTER_CRITICAL(&s_status_mux);

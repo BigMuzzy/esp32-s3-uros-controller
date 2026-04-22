@@ -51,6 +51,14 @@ extern "C" {
 #define VESC_VOLTAGE_MIN_V            18.0f
 #define VESC_VOLTAGE_MAX_V            60.0f
 
+/* Active ping (ADR-0009 Stage B).  Each attempt sends a PING to both
+ * VESCs and waits up to VESC_PING_TIMEOUT_MS for both PONGs.  If either
+ * pong is missing, retries VESC_PING_RETRIES times.  A successful ping
+ * is authoritative for liveness even if periodic status broadcasts are
+ * disabled. */
+#define VESC_PING_TIMEOUT_MS          100
+#define VESC_PING_RETRIES             2
+
 /* ── Types ───────────────────────────────────────────────────────── */
 
 /**

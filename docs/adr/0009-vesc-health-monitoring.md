@@ -53,19 +53,29 @@ Rationale for transmitting ERPM=0 rather than halting the firmware:
 the system remains observable (debug console, diagnostic topics)
 so the operator can fix wiring or configuration without reflashing.
 
-### Stage B — Active ping/pong (planned)
+### Stage B — Active ping/pong (implemented)
 
 VESC firmware answers `CAN_PACKET_PING` (cmd 17, 1-byte payload
-= sender ID) with `CAN_PACKET_PONG` (cmd 18). Stage B adds:
+= sender ID) with `CAN_PACKET_PONG` (cmd 18, 1-byte payload =
+responder's controller ID). The ESP32 uses sender ID
+`VESC_CAN_SENDER_ID = 0xFE` (matches VESC Tool convention; does
+not collide with `VESC_ID_LEFT`/`RIGHT`).
 
-- `vesc_can_encode_ping(target_id, sender_id, out_msg)`.
-- Pong decode in `can_rx_task` → sets a per-VESC event-group bit.
-- A boot-time ping exchange (3× retries, 100 ms timeout each)
-  that runs *before* the Stage A status wait.
+Boot sequence:
+
+1. Ping both VESCs in parallel, wait up to `VESC_PING_TIMEOUT_MS`
+   (100 ms) for both pongs, retry `VESC_PING_RETRIES` times (2).
+2. Proceed to Stage A status wait.
 
 Ping/pong is authoritative for liveness because it does not depend
-on the VESC being configured to broadcast periodic status. Stage A's
-status wait remains as a secondary check that also populates voltage.
+on the VESC being configured to broadcast periodic status. The
+Stage A status wait still runs — it confirms the VESC is actually
+producing the frames odometry needs and supplies voltage for the
+plausibility check. Both must pass for `BIT_ARMED` to be set.
+
+A missing PONG with present STATUS is theoretically possible but
+only via misconfigured firmware or bus-addressing collisions; the
+log in that case explicitly names the inconsistency.
 
 ### Stage C — Runtime watchdog & failsafe integration (planned)
 
