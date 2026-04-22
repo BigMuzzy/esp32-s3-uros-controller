@@ -5,6 +5,7 @@ idf_component_register(
          "rc_failsafe.c"
          "can_task.c"
          "uros_task.c"
+         "uros_transport_usb_jtag.c"
     INCLUDE_DIRS "."
     REQUIRES driver esp_timer micro_ros_espidf_component
 )

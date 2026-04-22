@@ -13,6 +13,7 @@
  */
 
 #include "uros_task.h"
+#include "uros_transport_usb_jtag.h"
 #include "can_task.h"
 #include "rc_failsafe.h"
 #include "diff_drive.h"
@@ -30,11 +31,9 @@
 #include <nav_msgs/msg/odometry.h>
 #include <std_msgs/msg/bool.h>
 
-#ifdef CONFIG_MICRO_ROS_ESP_XRCE_DDS_MIDDLEWARE
+#include <rmw_microxrcedds_c/config.h>
 #include <rmw_microros/rmw_microros.h>
-#endif
 
-#include <uros_network_interfaces.h>
 #include <math.h>
 
 static const char *TAG = "uros_task";
@@ -203,10 +202,20 @@ static void uros_task_fn(void *arg)
 
 esp_err_t uros_task_init(void)
 {
-#if defined(CONFIG_MICRO_ROS_ESP_USB_CDC_TRANSPORT)
-    ESP_LOGI(TAG, "Transport: USB-CDC");
+#if defined(RMW_UXRCE_TRANSPORT_CUSTOM)
+    /* Register USB-Serial/JTAG as the XRCE transport with HDLC framing.
+     * The host agent must be launched in `serial` mode against the
+     * enumerated CDC device (e.g. /dev/ttyACM0). */
+    rmw_uros_set_custom_transport(
+        true,                                   /* framing = true */
+        NULL,                                   /* no per-transport args */
+        uros_transport_usb_jtag_open,
+        uros_transport_usb_jtag_close,
+        uros_transport_usb_jtag_write,
+        uros_transport_usb_jtag_read);
+    ESP_LOGI(TAG, "Transport: USB-Serial/JTAG (custom, framed)");
 #else
-    ESP_LOGW(TAG, "micro-ROS transport not configured — check sdkconfig");
+#error "micro-ROS library not built with RMW_UXRCE_TRANSPORT=custom — check app-colcon.meta"
 #endif
 
     BaseType_t ok = xTaskCreatePinnedToCore(uros_task_fn, "uros",
