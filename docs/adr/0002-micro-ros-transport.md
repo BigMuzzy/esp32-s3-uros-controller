@@ -81,6 +81,33 @@ ros2 run micro_ros_agent micro_ros_agent serial --dev /dev/ttyACM0 -b 115200
 The baud rate is ignored by the USB CDC endpoint but still required
 by the agent's command line.
 
+### Link capacity
+
+USB-Serial/JTAG is USB 2.0 Full-Speed (12 Mbit/s signaling), CDC-ACM
+class, single bulk IN + single bulk OUT endpoint, 64-byte max packet
+size. Theoretical bulk ceiling is ~1.2 MB/s per direction; practical
+ESP32-S3 throughput is ~700–900 kB/s (≈5.6–7.2 Mbit/s) in either
+direction with large-buffer writes. Small writes bottleneck on
+per-packet overhead.
+
+Expected traffic for the planned topics:
+
+| Topic              | Rate | Payload | Bandwidth |
+|--------------------|------|---------|-----------|
+| `/cmd_vel` (sub)   | 10 Hz  | ~50 B   | ~0.5 kB/s |
+| `/odom` (pub)      | 100 Hz | ~720 B  | ~72 kB/s  |
+| `/failsafe/active` | 100 Hz | ~20 B   | ~2 kB/s   |
+
+With XRCE framing and DDS overhead (~2–3×), worst-case is well under
+300 kB/s — roughly 3× below the sustained link ceiling. Bandwidth is
+not a concern for this platform.
+
+Latency, not throughput, is the relevant metric. USB FS schedules bulk
+transfers on 1 ms microframe boundaries, giving a minimum round-trip
+of ~2–3 ms across the CDC pipe. That is comfortable for 100 Hz control
+and would only become limiting if a future topic needed ≥1 kHz update
+rates.
+
 ## Alternatives Considered
 
 ### A. Wi-Fi UDP
