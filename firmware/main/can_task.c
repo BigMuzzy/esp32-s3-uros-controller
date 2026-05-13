@@ -244,6 +244,20 @@ static void can_tx_task(void *arg)
         tx_ret = twai_transmit(&msg, pdMS_TO_TICKS(5));
         if (tx_ret != ESP_OK) s_tx_err_count++;
 
+        /* Rate-limited debug (~1 Hz): mode + commanded ERPM. Helps verify
+         * cmd_vel → kinematics → CAN path during bring-up. */
+        static TickType_t s_last_dbg;
+        if ((xTaskGetTickCount() - s_last_dbg) >= pdMS_TO_TICKS(1000)) {
+            const char *mode_str =
+                (mode == DRIVE_MODE_AUTONOMOUS)    ? "AUTO" :
+                (mode == DRIVE_MODE_MANUAL)        ? "MANUAL" :
+                (mode == DRIVE_MODE_FAILSAFE_STOP) ? "FAILSAFE" : "?";
+            ESP_LOGI(TAG, "tx: mode=%s armed=%d vesc_ok=%d erpm L=%" PRId32
+                          " R=%" PRId32,
+                     mode_str, armed, vesc_ok, erpm.left_erpm, erpm.right_erpm);
+            s_last_dbg = xTaskGetTickCount();
+        }
+
         if (s_tx_err_count > 0 &&
             (xTaskGetTickCount() - s_last_tx_err_log) >= pdMS_TO_TICKS(1000)) {
             ESP_LOGW(TAG, "TWAI TX errors: %" PRIu32 " in last ~1s (latest: %s)",

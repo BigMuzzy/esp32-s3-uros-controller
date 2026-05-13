@@ -28,12 +28,14 @@ extern "C" {
 
 /* ── Robot parameters (set per build) ────────────────────────────── */
 
-#define WHEEL_DIAMETER_M     0.100f   /* meters — measure and update */
-#define TRACK_WIDTH_M        0.300f   /* wheel-to-wheel center, meters */
-#define MOTOR_POLE_PAIRS     7        /* set per motor */
-#define MAX_WHEEL_ERPM       30000    /* safety clamp (signed) */
-#define MAX_MANUAL_SPEED_MS  1.0f     /* max linear vel in manual mode */
-#define MAX_MANUAL_ANGVEL    2.0f     /* max angular vel in manual mode, rad/s */
+#define WHEEL_DIAMETER_M     0.160f   /* meters — matches VESC MCCONF_SI_WHEEL_DIAMETER */
+#define TRACK_WIDTH_M        0.600f   /* wheel-to-wheel center, meters */
+#define MOTOR_POLE_PAIRS     7        /* VESC MCCONF_SI_MOTOR_POLES=14 → 7 pairs */
+#define MAX_WHEEL_ERPM       1000     /* matches VESC MCCONF_L_RPM_MAX (±1000) */
+#define MAX_MANUAL_SPEED_MS  1.0f     /* max linear vel in manual mode (m/s) */
+#define MAX_MANUAL_ANGVEL    0.67f    /* max angular vel in manual mode (rad/s);
+                                       * full stick + full steer = 1.0 + 0.67×0.3 ≈ 1.20 m/s
+                                       * = MAX_WHEEL_ERPM ceiling */
 
 /* ── Types ───────────────────────────────────────────────────────── */
 

@@ -19,6 +19,7 @@
 #include "diff_drive.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -77,6 +78,19 @@ static void cmd_vel_cb(const void *msg_in)
         .linear_x  = (float)twist->linear.x,
         .angular_z = (float)twist->angular.z,
     };
+
+    /* Rate-limited debug: confirm subscription is firing */
+    static uint32_t s_count;
+    static int64_t  s_last_log_us;
+    s_count++;
+    int64_t now = esp_timer_get_time();
+    if ((now - s_last_log_us) > 1000000) {
+        ESP_LOGI(TAG, "cmd_vel rx: lin=%.3f ang=%.3f (%lu msgs since last log)",
+                 cmd.linear_x, cmd.angular_z, (unsigned long)s_count);
+        s_count = 0;
+        s_last_log_us = now;
+    }
+
     can_task_set_cmd_vel(&cmd);
 }
 
