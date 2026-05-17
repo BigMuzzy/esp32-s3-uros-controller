@@ -79,16 +79,25 @@ static void cmd_vel_cb(const void *msg_in)
         .angular_z = (float)twist->angular.z,
     };
 
-    /* Rate-limited debug: confirm subscription is firing */
-    static uint32_t s_count;
-    static int64_t  s_last_log_us;
-    s_count++;
-    int64_t now = esp_timer_get_time();
-    if ((now - s_last_log_us) > 1000000) {
-        ESP_LOGI(TAG, "cmd_vel rx: lin=%.3f ang=%.3f (%lu msgs since last log)",
-                 cmd.linear_x, cmd.angular_z, (unsigned long)s_count);
-        s_count = 0;
-        s_last_log_us = now;
+    /* Edge-triggered debug: log only when the commanded Twist changes
+     * versus the previous callback.  Steady streams (e.g. teleop or
+     * Nav2 publishing the same value at 20 Hz) stay quiet; every
+     * transition — including hidden zero-Twist injections from a
+     * second publisher — produces one log line. */
+    static float    s_prev_lin = 0.0f;
+    static float    s_prev_ang = 0.0f;
+    static bool     s_have_prev;
+    static uint32_t s_same_count;
+    if (!s_have_prev ||
+        cmd.linear_x != s_prev_lin || cmd.angular_z != s_prev_ang) {
+        ESP_LOGI(TAG, "cmd_vel rx: lin=%.3f ang=%.3f (prev held %lu msgs)",
+                 cmd.linear_x, cmd.angular_z, (unsigned long)s_same_count);
+        s_prev_lin   = cmd.linear_x;
+        s_prev_ang   = cmd.angular_z;
+        s_have_prev  = true;
+        s_same_count = 0;
+    } else {
+        s_same_count++;
     }
 
     can_task_set_cmd_vel(&cmd);

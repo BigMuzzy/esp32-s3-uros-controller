@@ -17,6 +17,7 @@
 #include "freertos/event_groups.h"
 
 #include <inttypes.h>
+#include <stdlib.h>
 #include <string.h>
 
 static const char *TAG = "can_task";
@@ -228,28 +229,84 @@ static void can_tx_task(void *arg)
             }
         }
 
-        /* Send commands to both VESCs.  When the system is armed AND
-         * both target ERPMs are zero we issue SET_CURRENT_BRAKE instead
-         * of SET_RPM=0: this bypasses the speed PID and applies an
-         * active regenerative brake while the wheel is still turning,
-         * then holds at standstill (with `foc_short_ls_on_zero_duty`
-         * in MCCONF) without depending on PID wind-up.
+        /* Send commands to both VESCs.  Hybrid stop strategy when the
+         * system is armed and both target ERPMs are zero:
          *
-         * In the disarmed / watchdog-tripped path we keep SET_RPM=0
-         * — that path is reached when a VESC has already been flagged
-         * unhealthy, and the speed PID's gentler ramp-to-zero is the
-         * safer behavior there.  Log TX failures at most once per
-         * second so a bus-off or TX-queue-full condition is visible
-         * without flooding the log. */
-        bool brake = armed && vesc_ok &&
-                     (erpm.left_erpm == 0) && (erpm.right_erpm == 0);
+         *   ROLLING state, |actual ERPM| >= VESC_BRAKE_HOLD_ERPM_MAX
+         *     → SET_RPM=0.  The VESC speed PID applies up to
+         *       `l_current_max` (~25 A) to drive ERPM toward zero —
+         *       much stronger deceleration than the fixed
+         *       `VESC_BRAKE_CURRENT_MA` regen brake can provide,
+         *       and symmetric with the torque available when
+         *       reversing direction via SET_RPM.
+         *
+         *   ROLLING state, |actual ERPM| <  VESC_BRAKE_HOLD_ERPM_MAX
+         *     → enter BRAKING state, SET_CURRENT_BRAKE.
+         *
+         *   BRAKING state, target still zero
+         *     → stay in BRAKING, SET_CURRENT_BRAKE.  Sticky: once a
+         *       wheel has committed to brake we do *not* fall back to
+         *       SET_RPM=0 even if the VESC reports |actual| crossing
+         *       above the threshold (which it will, briefly, due to
+         *       PID overshoot from the last RPM=0 tick or mechanical
+         *       rebound).  Without this hysteresis the per-tick mode
+         *       switching fights the VESC's speed PID and produces a
+         *       limit-cycle oscillation around zero.
+         *
+         *   any state, target ERPM != 0
+         *     → exit BRAKING, SET_RPM=target (resumes normal motion
+         *       and re-arms the brake state machine for the next
+         *       deceleration).
+         *
+         * Decision is per-wheel because during a turn the two wheels
+         * can be at very different speeds when cmd_vel goes to zero.
+         *
+         * In the disarmed / watchdog-tripped path target_zero is
+         * forced false above, so we keep SET_RPM=0 (gentler ramp
+         * through the speed PID) — that is the safer behavior when
+         * a VESC has already been flagged unhealthy.  Log TX failures
+         * at most once per second so a bus-off or TX-queue-full
+         * condition is visible without flooding the log. */
+        bool target_zero = armed && vesc_ok &&
+                           (erpm.left_erpm == 0) && (erpm.right_erpm == 0);
+
+        /* Snapshot the most recent measured ERPM from each VESC's
+         * STATUS broadcast.  Freshness is already guaranteed by
+         * vesc_ok (watchdog gates on VESC_STATUS_TIMEOUT_MS). */
+        int32_t actual_erpm_left  = 0;
+        int32_t actual_erpm_right = 0;
+        taskENTER_CRITICAL(&s_status_mux);
+        actual_erpm_left  = s_vesc_status[0].erpm;
+        actual_erpm_right = s_vesc_status[1].erpm;
+        taskEXIT_CRITICAL(&s_status_mux);
+
+        /* Sticky per-wheel BRAKING state.  Cleared whenever the target
+         * ERPM is non-zero; latched the first tick the wheel decelerates
+         * inside VESC_BRAKE_HOLD_ERPM_MAX. */
+        static bool s_braking[2];
+        const int32_t target_per_side[2] = { erpm.left_erpm, erpm.right_erpm };
+        const int32_t actual_per_side[2] = { actual_erpm_left, actual_erpm_right };
+        bool brake_per_side[2] = { false, false };
+        for (int i = 0; i < 2; i++) {
+            if (target_per_side[i] != 0 || !target_zero) {
+                /* Non-zero command or disarmed/!vesc_ok path → not braking. */
+                s_braking[i] = false;
+            } else if (s_braking[i] ||
+                       abs(actual_per_side[i]) < VESC_BRAKE_HOLD_ERPM_MAX) {
+                /* Latched brake, or first cross below threshold. */
+                s_braking[i] = true;
+            }
+            brake_per_side[i] = s_braking[i];
+        }
+        bool brake_left  = brake_per_side[0];
+        bool brake_right = brake_per_side[1];
 
         twai_message_t msg;
         esp_err_t tx_ret;
         static uint32_t s_tx_err_count;
         static TickType_t s_last_tx_err_log;
 
-        if (brake) {
+        if (brake_left) {
             vesc_can_encode_current_brake(VESC_ID_LEFT,
                                           VESC_BRAKE_CURRENT_MA, &msg);
         } else {
@@ -258,7 +315,7 @@ static void can_tx_task(void *arg)
         tx_ret = twai_transmit(&msg, pdMS_TO_TICKS(5));
         if (tx_ret != ESP_OK) s_tx_err_count++;
 
-        if (brake) {
+        if (brake_right) {
             vesc_can_encode_current_brake(VESC_ID_RIGHT,
                                           VESC_BRAKE_CURRENT_MA, &msg);
         } else {
@@ -267,20 +324,28 @@ static void can_tx_task(void *arg)
         tx_ret = twai_transmit(&msg, pdMS_TO_TICKS(5));
         if (tx_ret != ESP_OK) s_tx_err_count++;
 
-        /* Rate-limited debug (~1 Hz): mode + commanded ERPM. Helps verify
-         * cmd_vel → kinematics → CAN path during bring-up. */
+        /* Rate-limited debug (~1 Hz): mode + commanded vs measured per
+         * wheel.  "rpm=" means SET_RPM with target value; "BRK_mA="
+         * means SET_CURRENT_BRAKE with brake current.  act= shows the
+         * latest measured ERPM used by the hybrid threshold. */
         static TickType_t s_last_dbg;
         if ((xTaskGetTickCount() - s_last_dbg) >= pdMS_TO_TICKS(1000)) {
             const char *mode_str =
                 (mode == DRIVE_MODE_AUTONOMOUS)    ? "AUTO" :
                 (mode == DRIVE_MODE_MANUAL)        ? "MANUAL" :
                 (mode == DRIVE_MODE_FAILSAFE_STOP) ? "FAILSAFE" : "?";
-            ESP_LOGI(TAG, "tx: mode=%s armed=%d vesc_ok=%d %s L=%" PRId32
-                          " R=%" PRId32,
+            ESP_LOGI(TAG, "tx: mode=%s armed=%d vesc_ok=%d "
+                          "L=%s%" PRId32 "(act=%" PRId32 ") "
+                          "R=%s%" PRId32 "(act=%" PRId32 ")",
                      mode_str, armed, vesc_ok,
-                     brake ? "BRAKE_mA" : "erpm",
-                     brake ? (int32_t)VESC_BRAKE_CURRENT_MA : erpm.left_erpm,
-                     brake ? (int32_t)VESC_BRAKE_CURRENT_MA : erpm.right_erpm);
+                     brake_left  ? "BRK_mA=" : "rpm=",
+                     brake_left  ? (int32_t)VESC_BRAKE_CURRENT_MA
+                                 : erpm.left_erpm,
+                     actual_erpm_left,
+                     brake_right ? "BRK_mA=" : "rpm=",
+                     brake_right ? (int32_t)VESC_BRAKE_CURRENT_MA
+                                 : erpm.right_erpm,
+                     actual_erpm_right);
             s_last_dbg = xTaskGetTickCount();
         }
 

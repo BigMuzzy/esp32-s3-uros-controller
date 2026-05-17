@@ -69,9 +69,22 @@ extern "C" {
  * is zero and the system is armed.  Acts as a regenerative brake
  * while the wheel is turning and draws ~0 A at standstill.  Tune
  * against `l_current_max` / `l_abs_current_max` in the VESC MCCONF;
- * value must be well below those limits.  4000 mA on a 25 A peak
- * setting is ~16 % current — strong hold, no fault risk. */
-#define VESC_BRAKE_CURRENT_MA         4000
+ * value must be well below those limits.  8000 mA on a ~25 A phase /
+ * 38 A absolute limit is ~32 % / ~21 % — firm hold, no fault risk. */
+#define VESC_BRAKE_CURRENT_MA         8000
+
+/* Hybrid stop threshold (|actual ERPM|).  When the target ERPM is zero
+ * but the wheel is still rolling faster than this, can_tx_task commands
+ * SET_RPM=0 instead of SET_CURRENT_BRAKE so the VESC speed PID can use
+ * the full `l_current_max` (≈25 A) for sharp deceleration — much
+ * stronger than the fixed `VESC_BRAKE_CURRENT_MA` regen brake.  Once
+ * |actual ERPM| drops below this threshold the firmware switches to
+ * SET_CURRENT_BRAKE for a clean, PID-free hold at standstill.
+ *
+ * 100 ERPM ≈ 14 rpm wheel ≈ 0.12 m/s with WHEEL_DIAMETER_M=0.160 — a
+ * slow crawl; below that, 8 A brake current decelerates to 0 in a
+ * single 20 ms tick. */
+#define VESC_BRAKE_HOLD_ERPM_MAX      100
 
 /* ── Types ───────────────────────────────────────────────────────── */
 
