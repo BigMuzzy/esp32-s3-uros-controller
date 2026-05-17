@@ -228,19 +228,42 @@ static void can_tx_task(void *arg)
             }
         }
 
-        /* Send ERPM commands to both VESCs. Log TX failures at most
-         * once per second so a bus-off or TX-queue-full condition is
-         * visible without flooding the log. */
+        /* Send commands to both VESCs.  When the system is armed AND
+         * both target ERPMs are zero we issue SET_CURRENT_BRAKE instead
+         * of SET_RPM=0: this bypasses the speed PID and applies an
+         * active regenerative brake while the wheel is still turning,
+         * then holds at standstill (with `foc_short_ls_on_zero_duty`
+         * in MCCONF) without depending on PID wind-up.
+         *
+         * In the disarmed / watchdog-tripped path we keep SET_RPM=0
+         * — that path is reached when a VESC has already been flagged
+         * unhealthy, and the speed PID's gentler ramp-to-zero is the
+         * safer behavior there.  Log TX failures at most once per
+         * second so a bus-off or TX-queue-full condition is visible
+         * without flooding the log. */
+        bool brake = armed && vesc_ok &&
+                     (erpm.left_erpm == 0) && (erpm.right_erpm == 0);
+
         twai_message_t msg;
         esp_err_t tx_ret;
         static uint32_t s_tx_err_count;
         static TickType_t s_last_tx_err_log;
 
-        vesc_can_encode_rpm(VESC_ID_LEFT, erpm.left_erpm, &msg);
+        if (brake) {
+            vesc_can_encode_current_brake(VESC_ID_LEFT,
+                                          VESC_BRAKE_CURRENT_MA, &msg);
+        } else {
+            vesc_can_encode_rpm(VESC_ID_LEFT, erpm.left_erpm, &msg);
+        }
         tx_ret = twai_transmit(&msg, pdMS_TO_TICKS(5));
         if (tx_ret != ESP_OK) s_tx_err_count++;
 
-        vesc_can_encode_rpm(VESC_ID_RIGHT, erpm.right_erpm, &msg);
+        if (brake) {
+            vesc_can_encode_current_brake(VESC_ID_RIGHT,
+                                          VESC_BRAKE_CURRENT_MA, &msg);
+        } else {
+            vesc_can_encode_rpm(VESC_ID_RIGHT, erpm.right_erpm, &msg);
+        }
         tx_ret = twai_transmit(&msg, pdMS_TO_TICKS(5));
         if (tx_ret != ESP_OK) s_tx_err_count++;
 
@@ -252,9 +275,12 @@ static void can_tx_task(void *arg)
                 (mode == DRIVE_MODE_AUTONOMOUS)    ? "AUTO" :
                 (mode == DRIVE_MODE_MANUAL)        ? "MANUAL" :
                 (mode == DRIVE_MODE_FAILSAFE_STOP) ? "FAILSAFE" : "?";
-            ESP_LOGI(TAG, "tx: mode=%s armed=%d vesc_ok=%d erpm L=%" PRId32
+            ESP_LOGI(TAG, "tx: mode=%s armed=%d vesc_ok=%d %s L=%" PRId32
                           " R=%" PRId32,
-                     mode_str, armed, vesc_ok, erpm.left_erpm, erpm.right_erpm);
+                     mode_str, armed, vesc_ok,
+                     brake ? "BRAKE_mA" : "erpm",
+                     brake ? (int32_t)VESC_BRAKE_CURRENT_MA : erpm.left_erpm,
+                     brake ? (int32_t)VESC_BRAKE_CURRENT_MA : erpm.right_erpm);
             s_last_dbg = xTaskGetTickCount();
         }
 

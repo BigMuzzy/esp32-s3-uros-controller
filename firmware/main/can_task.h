@@ -65,6 +65,14 @@ extern "C" {
  * broadcast (default), 200 ms = 10 missed frames. */
 #define VESC_STATUS_TIMEOUT_MS        200
 
+/* Active-brake current (mA) commanded when both wheels' target ERPM
+ * is zero and the system is armed.  Acts as a regenerative brake
+ * while the wheel is turning and draws ~0 A at standstill.  Tune
+ * against `l_current_max` / `l_abs_current_max` in the VESC MCCONF;
+ * value must be well below those limits.  4000 mA on a 25 A peak
+ * setting is ~16 % current — strong hold, no fault risk. */
+#define VESC_BRAKE_CURRENT_MA         4000
+
 /* ── Types ───────────────────────────────────────────────────────── */
 
 /**

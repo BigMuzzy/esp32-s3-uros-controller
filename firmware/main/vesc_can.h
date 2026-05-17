@@ -11,9 +11,10 @@
  *   ID[7:0]  = VESC controller ID
  *
  * Supported commands:
- *   TX: CAN_PACKET_SET_RPM  (cmd 3)  — ERPM set-point, 4-byte big-endian
- *   RX: CAN_PACKET_STATUS   (cmd 9)  — ERPM, current, duty
- *   RX: CAN_PACKET_STATUS_5 (cmd 27) — tachometer (cumulative ERPM ticks), v_in
+ *   TX: CAN_PACKET_SET_RPM           (cmd 3)  — ERPM set-point, 4-byte big-endian
+ *   TX: CAN_PACKET_SET_CURRENT_BRAKE (cmd 6)  — brake current (mA), 4-byte big-endian
+ *   RX: CAN_PACKET_STATUS            (cmd 9)  — ERPM, current, duty
+ *   RX: CAN_PACKET_STATUS_5          (cmd 27) — tachometer (cumulative ERPM ticks), v_in
  *
  * Note: STATUS_2/3/4 (cmd 14/15/16) carry amp-hours, watt-hours, and
  * temperatures respectively — not used here. Do not confuse STATUS_4
@@ -39,11 +40,12 @@ extern "C" {
 
 /* ── CAN command IDs ─────────────────────────────────────────────── */
 
-#define VESC_CAN_CMD_SET_RPM    3
-#define VESC_CAN_CMD_STATUS     9
-#define VESC_CAN_CMD_PING      17
-#define VESC_CAN_CMD_PONG      18
-#define VESC_CAN_CMD_STATUS_5  27
+#define VESC_CAN_CMD_SET_RPM            3
+#define VESC_CAN_CMD_SET_CURRENT_BRAKE  6
+#define VESC_CAN_CMD_STATUS             9
+#define VESC_CAN_CMD_PING              17
+#define VESC_CAN_CMD_PONG              18
+#define VESC_CAN_CMD_STATUS_5          27
 
 /* Sender ID used by this ESP32 in ping requests.  Must not collide
  * with any VESC_ID_* on the bus.  VESC firmware treats IDs 0..253
@@ -84,6 +86,27 @@ typedef struct {
  */
 void vesc_can_encode_rpm(uint8_t vesc_id, int32_t erpm,
                          twai_message_t *out_msg);
+
+/**
+ * Build a TWAI message that commands a VESC to apply a brake current.
+ *
+ * The VESC interprets this as a regenerative-brake current set-point:
+ * while the rotor is turning it opposes motion proportionally to
+ * `current_ma`; at standstill it draws ~0 A.  Combined with the VESC
+ * `foc_short_ls_on_zero_duty` setting it provides an active hold
+ * without requiring the speed PID to run.
+ *
+ * Bypasses the speed PID — use this instead of SET_RPM=0 when the
+ * intent is "stop and hold", not "track zero velocity".
+ *
+ * @param vesc_id     Target VESC controller ID.
+ * @param current_ma  Brake current in milliamps (always positive; VESC
+ *                    derives the sign from rotor direction).  Clamped
+ *                    by the VESC against `l_current_max` / `l_abs_max`.
+ * @param out_msg     Filled with the ready-to-transmit TWAI message.
+ */
+void vesc_can_encode_current_brake(uint8_t vesc_id, int32_t current_ma,
+                                   twai_message_t *out_msg);
 
 /**
  * Build a TWAI message that pings a VESC.  The target VESC replies

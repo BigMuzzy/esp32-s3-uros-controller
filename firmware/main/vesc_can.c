@@ -48,6 +48,23 @@ void vesc_can_encode_rpm(uint8_t vesc_id, int32_t erpm,
     put_be32(out_msg->data, erpm);
 }
 
+/*
+ * CAN_PACKET_SET_CURRENT_BRAKE (cmd 6), 4 bytes:
+ *   [0:3] brake current in milliamps — int32, big-endian.
+ * The VESC opposes rotor motion with this magnitude regardless of
+ * direction; at standstill, output current is ~0.
+ */
+void vesc_can_encode_current_brake(uint8_t vesc_id, int32_t current_ma,
+                                   twai_message_t *out_msg)
+{
+    memset(out_msg, 0, sizeof(*out_msg));
+    out_msg->extd = 1;
+    out_msg->identifier =
+        ((uint32_t)VESC_CAN_CMD_SET_CURRENT_BRAKE << 8) | vesc_id;
+    out_msg->data_length_code = 4;
+    put_be32(out_msg->data, current_ma);
+}
+
 void vesc_can_encode_ping(uint8_t target_vesc_id, uint8_t sender_id,
                           twai_message_t *out_msg)
 {
