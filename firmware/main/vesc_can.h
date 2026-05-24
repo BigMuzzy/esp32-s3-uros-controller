@@ -28,6 +28,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "driver/twai.h"
+#include "esp_err.h"
+#include "freertos/FreeRTOS.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -40,12 +42,25 @@ extern "C" {
 
 /* ── CAN command IDs ─────────────────────────────────────────────── */
 
-#define VESC_CAN_CMD_SET_RPM            3
-#define VESC_CAN_CMD_SET_CURRENT_BRAKE  6
-#define VESC_CAN_CMD_STATUS             9
-#define VESC_CAN_CMD_PING              17
-#define VESC_CAN_CMD_PONG              18
-#define VESC_CAN_CMD_STATUS_5          27
+#define VESC_CAN_CMD_SET_RPM                3
+#define VESC_CAN_CMD_FILL_RX_BUFFER         5
+#define VESC_CAN_CMD_FILL_RX_BUFFER_LONG    6
+#define VESC_CAN_CMD_PROCESS_RX_BUFFER      7
+#define VESC_CAN_CMD_PROCESS_SHORT_BUFFER   8
+#define VESC_CAN_CMD_STATUS                 9
+#define VESC_CAN_CMD_PING                  17
+#define VESC_CAN_CMD_PONG                  18
+#define VESC_CAN_CMD_STATUS_5              27
+
+/* Note: VESC_CAN_CMD_SET_CURRENT_BRAKE was previously defined as 6.
+ * That collides with FILL_RX_BUFFER_LONG in VESC's protocol — the
+ * correct enum value is 2 (CAN_PACKET_SET_CURRENT_BRAKE).  Failsafe
+ * frames using the old value are silently ignored by the VESC.  Kept
+ * here for source compatibility; fix in a separate change. */
+#define VESC_CAN_CMD_SET_CURRENT_BRAKE      6
+
+/* VESC commands packet IDs (payload of COMM_TERMINAL_CMD etc.) */
+#define VESC_COMM_TERMINAL_CMD             20
 
 /* Sender ID used by this ESP32 in ping requests.  Must not collide
  * with any VESC_ID_* on the bus.  VESC firmware treats IDs 0..253
@@ -120,6 +135,32 @@ void vesc_can_encode_current_brake(uint8_t vesc_id, int32_t current_ma,
  */
 void vesc_can_encode_ping(uint8_t target_vesc_id, uint8_t sender_id,
                           twai_message_t *out_msg);
+
+/**
+ * Send a VESC text-terminal command to one VESC over CAN.
+ *
+ * Wraps an ASCII command string (e.g. "set_mcconf_param s_pid_kp 0.005",
+ * "mcconf_store") in a COMM_TERMINAL_CMD packet (id 20) and transmits
+ * it via either CAN_PACKET_PROCESS_SHORT_BUFFER (single frame, when the
+ * total payload fits in 6 bytes) or a CAN_PACKET_FILL_RX_BUFFER stream
+ * followed by CAN_PACKET_PROCESS_RX_BUFFER (CRC-checked).  send_mode is
+ * fixed to 2 (process locally, no reply) — caller does not see any
+ * response.
+ *
+ * Calls `twai_transmit()` directly; the TWAI driver must be running.
+ * Safe to call concurrently with the periodic can_tx_task — the TWAI
+ * driver serializes transmit calls internally.
+ *
+ * @param vesc_id  Target VESC controller ID.
+ * @param cmd      NUL-terminated ASCII terminal command.  strlen(cmd)
+ *                 must be <= 254 (one-byte FILL_RX offset).
+ * @param timeout  Per-frame TWAI transmit timeout (FreeRTOS ticks).
+ * @return         ESP_OK on success; ESP_ERR_INVALID_ARG for bad input;
+ *                 ESP_ERR_INVALID_SIZE if cmd is too long; otherwise
+ *                 the first failing twai_transmit() error code.
+ */
+esp_err_t vesc_can_send_terminal_cmd(uint8_t vesc_id, const char *cmd,
+                                     TickType_t timeout);
 
 /* ── RX: status decoding ────────────────────────────────────────── */
 

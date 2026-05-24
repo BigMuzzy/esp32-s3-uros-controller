@@ -1,0 +1,28 @@
+menu "Tuning CLI (VESC PID)"
+
+config TUNE_WIFI_ENABLE
+    bool "Enable WiFi TCP transport"
+    default n
+    help
+        When enabled, tune_cli prefers a TCP server over WiFi STA
+        instead of UART0. UART0 remains the fallback if WiFi fails
+        to start. The CLI line protocol is identical on both
+        transports.
+
+config TUNE_WIFI_SSID
+    string "WiFi SSID"
+    default ""
+    depends on TUNE_WIFI_ENABLE
+
+config TUNE_WIFI_PASSWORD
+    string "WiFi password (WPA2 PSK; empty = open)"
+    default ""
+    depends on TUNE_WIFI_ENABLE
+
+config TUNE_WIFI_PORT
+    int "TCP port for the tuning CLI"
+    range 1 65535
+    default 3334
+    depends on TUNE_WIFI_ENABLE
+
+endmenu

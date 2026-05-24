@@ -15,6 +15,7 @@
 #include "rc_failsafe.h"
 #include "can_task.h"
 #include "uros_task.h"
+#include "tune_cli.h"
 
 static const char *TAG = "main";
 
@@ -47,6 +48,17 @@ void app_main(void)
         return;
     }
     ESP_LOGI(TAG, "micro-ROS task started on Core 0");
+
+    /* 4. Tuning CLI — UART0 today (transport-abstracted, WiFi planned).
+     * Independent of micro-ROS; safe to leave running. Non-fatal if it
+     * fails to start — the rest of the controller keeps working. */
+    ret = tune_cli_init();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "tune_cli_init failed: %s (continuing)",
+                 esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "tune_cli started");
+    }
 
     /* app_main returns — FreeRTOS tasks run independently */
     ESP_LOGI(TAG, "All tasks running");

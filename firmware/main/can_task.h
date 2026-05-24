@@ -97,7 +97,11 @@ extern "C" {
  *                    watchdog has seen a STATUS frame within
  *                    VESC_STATUS_TIMEOUT_MS.  Cleared by the watchdog
  *                    on timeout; re-set when STATUS resumes (boot-time
- *                    failure is sticky until reboot).
+ *                    failure is sticky until reboot — see boot_passed).
+ *   boot_passed    — true once the boot-time health check succeeded.
+ *                    Sticky; never cleared by the runtime watchdog.
+ *                    Used as the gate that lets runtime re-arm `online`
+ *                    after a transient STATUS gap clears.
  *   voltage_in     — last decoded STATUS_5 input voltage (volts).  0 if
  *                    no STATUS_5 has been received yet.
  *   fault_code     — reserved for STATUS_6 decode.  Always 0 at present.
@@ -106,6 +110,7 @@ extern "C" {
  */
 typedef struct {
     bool     online;
+    bool     boot_passed;
     float    voltage_in;
     uint8_t  fault_code;
     uint32_t last_status_ms;
@@ -163,6 +168,38 @@ bool can_task_get_vesc_status(uint8_t vesc_id, vesc_status_t *status_out);
  * @return true if vesc_id is valid; false otherwise.
  */
 bool can_task_get_vesc_health(uint8_t vesc_id, vesc_health_t *health_out);
+
+/* ── Tune-mode override (used by tune_cli) ───────────────────────── */
+
+/* Watchdog timeout for the tune override: if it has not been refreshed
+ * within this window, can_tx_task ignores it and resumes normal
+ * cmd_vel / RC handling. Keep short — tune_cli refreshes at ≥50 Hz. */
+#define TUNE_OVERRIDE_TIMEOUT_MS  150
+
+/**
+ * Install a per-wheel ERPM override from the tuning CLI (Core 0).
+ *
+ * While the override is fresh (refreshed within TUNE_OVERRIDE_TIMEOUT_MS),
+ * `can_tx_task` substitutes these ERPM targets for the normal cmd_vel /
+ * RC-derived targets ONLY when:
+ *   - the system is ARMED and VESC watchdog is healthy, AND
+ *   - the RC failsafe drive mode is DRIVE_MODE_AUTONOMOUS
+ *     (i.e. RC is not in MANUAL and not in FAILSAFE_STOP).
+ *
+ * RC failsafe and the VESC health watchdog remain authoritative: a
+ * MANUAL stick deflection or a kill-switch / status timeout still wins
+ * over the override.  The override expires automatically when not
+ * refreshed.
+ *
+ * Thread-safe (spinlock).  Safe to call from any task.
+ */
+void can_task_set_tune_override(int32_t erpm_left, int32_t erpm_right);
+
+/**
+ * Immediately clear any active tune override.  Equivalent to letting
+ * it expire, but instantaneous.  Thread-safe.
+ */
+void can_task_clear_tune_override(void);
 
 #ifdef __cplusplus
 }

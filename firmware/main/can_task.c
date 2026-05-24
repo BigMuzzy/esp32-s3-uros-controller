@@ -41,6 +41,15 @@ static vesc_status5_t s_vesc_status5[2];
 static bool           s_status_valid[2];
 static vesc_health_t  s_vesc_health[2];
 
+/* Tune-mode override (set by tune_cli on Core 0, read by can_tx_task
+ * on Core 1).  Active only while `last_refresh_ms` is within
+ * TUNE_OVERRIDE_TIMEOUT_MS.  Cleared by `can_task_clear_tune_override()`
+ * by zeroing last_refresh_ms. */
+static portMUX_TYPE s_tune_mux = portMUX_INITIALIZER_UNLOCKED;
+static int32_t      s_tune_erpm_left;
+static int32_t      s_tune_erpm_right;
+static uint32_t     s_tune_refresh_ms;  /* 0 = inactive */
+
 /* Event group used during boot health check and for runtime arming.
  * Bits 0/1: STATUS   seen from LEFT/RIGHT.
  * Bits 2/3: STATUS_5 seen from LEFT/RIGHT.
@@ -75,7 +84,8 @@ static int32_t s_erpm_right;
 
 /* Per-VESC runtime watchdog.  Returns true if all VESCs have reported
  * STATUS recently; updates s_vesc_health[i].online accordingly and
- * logs edge transitions. */
+ * logs edge transitions.  Re-arms online when STATUS resumes after a
+ * transient timeout, gated by the sticky boot_passed flag. */
 static bool vesc_watchdog_check(uint32_t now_ms)
 {
     static bool s_was_online[2] = { true, true };
@@ -84,11 +94,11 @@ static bool vesc_watchdog_check(uint32_t now_ms)
 
     for (int i = 0; i < 2; i++) {
         uint32_t last_ms;
-        bool boot_online;
+        bool boot_passed;
         float   voltage;
         taskENTER_CRITICAL(&s_status_mux);
         last_ms     = s_vesc_health[i].last_status_ms;
-        boot_online = s_vesc_health[i].online;
+        boot_passed = s_vesc_health[i].boot_passed;
         voltage     = s_vesc_health[i].voltage_in;
         taskEXIT_CRITICAL(&s_status_mux);
 
@@ -99,7 +109,7 @@ static bool vesc_watchdog_check(uint32_t now_ms)
                      ((now_ms - last_ms) <= VESC_STATUS_TIMEOUT_MS);
         bool voltage_ok = (voltage >= VESC_VOLTAGE_MIN_V) &&
                           (voltage <= VESC_VOLTAGE_MAX_V);
-        bool online = boot_online && fresh && voltage_ok;
+        bool online = boot_passed && fresh && voltage_ok;
 
         if (online != s_was_online[i]) {
             if (online) {
@@ -116,17 +126,15 @@ static bool vesc_watchdog_check(uint32_t now_ms)
                          VESC_VOLTAGE_MIN_V, VESC_VOLTAGE_MAX_V);
             }
             s_was_online[i] = online;
-
-            /* Publish the runtime state so /vesc/health reflects the
-             * watchdog verdict, not just the boot result.  Boot-time
-             * `online = false` is sticky — runtime watchdog only
-             * downgrades a previously-armed VESC. */
-            taskENTER_CRITICAL(&s_status_mux);
-            if (boot_online) {
-                s_vesc_health[i].online = online;
-            }
-            taskEXIT_CRITICAL(&s_status_mux);
         }
+
+        /* Always publish the current runtime verdict so /vesc/health
+         * tracks transient timeouts both ways.  boot_passed=false makes
+         * `online` stuck at false here, so a boot-time failure remains
+         * sticky until reboot. */
+        taskENTER_CRITICAL(&s_status_mux);
+        s_vesc_health[i].online = online;
+        taskEXIT_CRITICAL(&s_status_mux);
 
         if (!online) all_online = false;
     }
@@ -210,6 +218,24 @@ static void can_tx_task(void *arg)
         if (armed && vesc_ok) {
             switch (mode) {
             case DRIVE_MODE_AUTONOMOUS: {
+                /* Tune override (if fresh) wins over cmd_vel in AUTO
+                 * mode.  MANUAL and FAILSAFE paths are untouched. */
+                int32_t t_left = 0, t_right = 0;
+                uint32_t t_refresh = 0;
+                taskENTER_CRITICAL(&s_tune_mux);
+                t_left    = s_tune_erpm_left;
+                t_right   = s_tune_erpm_right;
+                t_refresh = s_tune_refresh_ms;
+                taskEXIT_CRITICAL(&s_tune_mux);
+
+                bool tune_fresh = (t_refresh != 0) &&
+                                  ((now_ms - t_refresh) <= TUNE_OVERRIDE_TIMEOUT_MS);
+                if (tune_fresh) {
+                    erpm.left_erpm  = t_left;
+                    erpm.right_erpm = t_right;
+                    break;
+                }
+
                 cmd_vel_t cmd;
                 taskENTER_CRITICAL(&s_cmd_vel_mux);
                 cmd = s_cmd_vel;
@@ -223,9 +249,32 @@ static void can_tx_task(void *arg)
                 erpm = diff_drive_cmd_vel_to_erpm(&cmd);
                 break;
             }
-            case DRIVE_MODE_FAILSAFE_STOP:
-                /* erpm already zeroed */
+            case DRIVE_MODE_FAILSAFE_STOP: {
+                /* Tune override is also honored in FAILSAFE_STOP so the
+                 * controller is usable on the bench without an RC link
+                 * (no transmitter, no PWM → default mode is FAILSAFE).
+                 * Still gated by `armed && vesc_ok` above, by the
+                 * 150 ms override-refresh watchdog, and by an explicit
+                 * `enable` from the tune CLI.  MANUAL stick deflection
+                 * always wins over a tune override because we never
+                 * reach this case while the RC is active. */
+                int32_t t_left = 0, t_right = 0;
+                uint32_t t_refresh = 0;
+                taskENTER_CRITICAL(&s_tune_mux);
+                t_left    = s_tune_erpm_left;
+                t_right   = s_tune_erpm_right;
+                t_refresh = s_tune_refresh_ms;
+                taskEXIT_CRITICAL(&s_tune_mux);
+
+                bool tune_fresh = (t_refresh != 0) &&
+                                  ((now_ms - t_refresh) <= TUNE_OVERRIDE_TIMEOUT_MS);
+                if (tune_fresh) {
+                    erpm.left_erpm  = t_left;
+                    erpm.right_erpm = t_right;
+                }
+                /* else erpm stays zeroed */
                 break;
+            }
             }
         }
 
@@ -553,7 +602,8 @@ static void vesc_boot_health_check(void)
         }
 
         taskENTER_CRITICAL(&s_status_mux);
-        s_vesc_health[i].online = ok;
+        s_vesc_health[i].online      = ok;
+        s_vesc_health[i].boot_passed = ok;
         taskEXIT_CRITICAL(&s_status_mux);
 
         if (!ok) all_ok = false;
@@ -663,4 +713,27 @@ bool can_task_get_vesc_health(uint8_t vesc_id, vesc_health_t *health_out)
     taskEXIT_CRITICAL(&s_status_mux);
 
     return true;
+}
+
+void can_task_set_tune_override(int32_t erpm_left, int32_t erpm_right)
+{
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    /* Avoid the magic-zero marker so override can never appear stale
+     * just because the millisecond counter happened to be 0. */
+    if (now_ms == 0) now_ms = 1;
+
+    taskENTER_CRITICAL(&s_tune_mux);
+    s_tune_erpm_left  = erpm_left;
+    s_tune_erpm_right = erpm_right;
+    s_tune_refresh_ms = now_ms;
+    taskEXIT_CRITICAL(&s_tune_mux);
+}
+
+void can_task_clear_tune_override(void)
+{
+    taskENTER_CRITICAL(&s_tune_mux);
+    s_tune_refresh_ms = 0;
+    s_tune_erpm_left  = 0;
+    s_tune_erpm_right = 0;
+    taskEXIT_CRITICAL(&s_tune_mux);
 }

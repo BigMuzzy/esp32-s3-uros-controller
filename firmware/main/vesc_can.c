@@ -127,3 +127,94 @@ bool vesc_can_decode_pong(const twai_message_t *msg, uint8_t *responder_id)
     *responder_id = msg->data[0];
     return true;
 }
+
+/* ── Terminal-command tunnel over CAN ────────────────────────────── */
+
+/* CRC16-CCITT, poly 0x1021, init 0x0000 — matches VESC firmware
+ * `crc.c::crc16()`.  Computed on the fly to avoid a 512-byte table;
+ * terminal commands are short (<=64 bytes) so the per-byte loop is
+ * negligible. */
+static uint16_t vesc_crc16(const uint8_t *buf, size_t len)
+{
+    uint16_t crc = 0x0000;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)buf[i] << 8;
+        for (int b = 0; b < 8; b++) {
+            crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021)
+                                 : (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+esp_err_t vesc_can_send_terminal_cmd(uint8_t vesc_id, const char *cmd,
+                                     TickType_t timeout)
+{
+    if (cmd == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    size_t cmd_len = strlen(cmd);
+    size_t total   = cmd_len + 1;            /* +1 for COMM_TERMINAL_CMD byte */
+    if (total > 254) {                       /* 1-byte FILL_RX offset cap */
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    /* Build the VESC commands-layer buffer: [comm_id, cmd bytes...]. */
+    uint8_t buf[256];
+    buf[0] = VESC_COMM_TERMINAL_CMD;
+    memcpy(buf + 1, cmd, cmd_len);
+
+    twai_message_t msg;
+    esp_err_t err;
+
+    /* Single-frame fast path: PROCESS_SHORT_BUFFER carries up to 6
+     * payload bytes (8-byte frame minus sender_id + send_mode). */
+    if (total <= 6) {
+        memset(&msg, 0, sizeof(msg));
+        msg.extd = 1;
+        msg.identifier =
+            ((uint32_t)VESC_CAN_CMD_PROCESS_SHORT_BUFFER << 8) | vesc_id;
+        msg.data_length_code = (uint8_t)(2 + total);
+        msg.data[0] = VESC_CAN_SENDER_ID;
+        msg.data[1] = 2;                     /* send_mode: process locally */
+        memcpy(msg.data + 2, buf, total);
+        return twai_transmit(&msg, timeout);
+    }
+
+    /* Fragmented path: stream the buffer via FILL_RX_BUFFER frames
+     * (1-byte offset + up to 7 payload bytes each), then commit with
+     * PROCESS_RX_BUFFER carrying the CRC over the entire buffer. */
+    size_t off = 0;
+    while (off < total) {
+        size_t chunk = total - off;
+        if (chunk > 7) {
+            chunk = 7;
+        }
+        memset(&msg, 0, sizeof(msg));
+        msg.extd = 1;
+        msg.identifier =
+            ((uint32_t)VESC_CAN_CMD_FILL_RX_BUFFER << 8) | vesc_id;
+        msg.data_length_code = (uint8_t)(1 + chunk);
+        msg.data[0] = (uint8_t)off;
+        memcpy(msg.data + 1, buf + off, chunk);
+        err = twai_transmit(&msg, timeout);
+        if (err != ESP_OK) {
+            return err;
+        }
+        off += chunk;
+    }
+
+    uint16_t crc = vesc_crc16(buf, total);
+    memset(&msg, 0, sizeof(msg));
+    msg.extd = 1;
+    msg.identifier =
+        ((uint32_t)VESC_CAN_CMD_PROCESS_RX_BUFFER << 8) | vesc_id;
+    msg.data_length_code = 6;
+    msg.data[0] = VESC_CAN_SENDER_ID;
+    msg.data[1] = 2;                         /* send_mode: process locally */
+    msg.data[2] = (uint8_t)(total >> 8);
+    msg.data[3] = (uint8_t)(total & 0xFF);
+    msg.data[4] = (uint8_t)(crc >> 8);
+    msg.data[5] = (uint8_t)(crc & 0xFF);
+    return twai_transmit(&msg, timeout);
+}
