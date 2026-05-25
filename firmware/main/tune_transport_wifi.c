@@ -7,7 +7,7 @@
  * TCP client. The CLI line protocol is identical on both transports.
  *
  * Safety on disconnect:
- *   - The CAN override watchdog in can_task expires after 150 ms when
+ *   - The CAN override watchdog in motor_task expires after 150 ms when
  *     tune_cli stops refreshing it, so a TCP drop, AP drop, or radio
  *     blackout stops the motors automatically.
  *   - Only one client is served at a time; a new connection displaces

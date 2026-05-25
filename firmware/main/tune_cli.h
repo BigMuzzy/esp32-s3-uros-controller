@@ -13,7 +13,7 @@
  * Safety:
  *   - All motion commands require "enable" first.
  *   - The CAN override expires automatically if not refreshed in
- *     TUNE_OVERRIDE_TIMEOUT_MS (handled by can_task) — link loss
+ *     TUNE_OVERRIDE_TIMEOUT_MS (handled by motor_task) — link loss
  *     (UART unplug, TCP disconnect, task crash) ⇒ motors stop.
  *   - RC failsafe and VESC health watchdog remain authoritative.
  *

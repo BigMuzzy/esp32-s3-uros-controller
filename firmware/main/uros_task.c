@@ -14,7 +14,8 @@
 
 #include "uros_task.h"
 #include "uros_transport_usb_jtag.h"
-#include "can_task.h"
+#include "motor_task.h"
+#include "motor_driver_vesc.h"   /* VESC-backend-specific battery health */
 #include "rc_failsafe.h"
 #include "diff_drive.h"
 
@@ -100,7 +101,7 @@ static void cmd_vel_cb(const void *msg_in)
         s_same_count++;
     }
 
-    can_task_set_cmd_vel(&cmd);
+    motor_task_set_cmd_vel(&cmd);
 }
 
 /* ── Publish helpers ─────────────────────────────────────────────── */
@@ -108,7 +109,7 @@ static void cmd_vel_cb(const void *msg_in)
 static void publish_odom(rcl_publisher_t *pub)
 {
     odom_state_t odom;
-    can_task_get_odom(&odom);
+    motor_task_get_odom(&odom);
 
     /* Header */
     /* frame_id and child_frame_id are set once at init */
@@ -139,7 +140,7 @@ static void publish_failsafe(rcl_publisher_t *pub)
 static void publish_battery(rcl_publisher_t *pub, uint8_t vesc_id, int idx)
 {
     vesc_health_t h;
-    if (!can_task_get_vesc_health(vesc_id, &h)) return;
+    if (!motor_driver_vesc_get_health(vesc_id, &h)) return;
 
     sensor_msgs__msg__BatteryState *m = &s_battery_msg[idx];
     m->voltage  = h.voltage_in;

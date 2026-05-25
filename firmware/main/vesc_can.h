@@ -20,7 +20,7 @@
  * temperatures respectively — not used here. Do not confuse STATUS_4
  * with STATUS_5; only STATUS_5 contains tachometer + voltage.
  *
- * Requires TWAI driver to be initialized separately (see can_task.h).
+ * Requires TWAI driver to be initialized separately (see motor_driver_vesc.c).
  */
 
 #pragma once

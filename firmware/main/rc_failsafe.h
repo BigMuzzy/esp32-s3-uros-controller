@@ -19,7 +19,7 @@
  * (or enters FAILSAFE_STOP if cmd_vel has timed out).
  *
  * In MANUAL mode, arcade mixing converts throttle + steering into
- * a cmd_vel_t, then uses diff_drive_cmd_vel_to_erpm() — same code
+ * a cmd_vel_t, then uses diff_drive_cmd_vel_to_wheel_rpm() — same code
  * path as autonomous driving.
  *
  * All functions run on Core 1 (rc_failsafe_task), except
@@ -94,7 +94,7 @@ drive_mode_t rc_failsafe_get_mode(void);
 
 /**
  * Arcade-mix RC inputs into a cmd_vel suitable for
- * diff_drive_cmd_vel_to_erpm(). Only valid in MANUAL mode.
+ * diff_drive_cmd_vel_to_wheel_rpm(). Only valid in MANUAL mode.
  *
  * Applies deadband, normalizes to [-1, +1], scales by
  * MAX_MANUAL_SPEED_MS and MAX_MANUAL_ANGVEL (from diff_drive.h).
