@@ -1,786 +1,631 @@
 /*
- * motor_driver_zlac8015d.c — ZLAC8015D CANopen motor-driver backend
+ * motor_driver_zlac8015d.c — CANopen backend for the ZLAC8015D V4 drive.
  *
- * Implements the hardware-agnostic motor_driver.h HAL on top of two
- * CANopen-CiA-402 axes, presented as separate node IDs on a shared
- * 500 kbit/s TWAI bus.
+ * Hardware topology (verified against the vendor "CANopen Communication
+ * Quick Start Guide" + "Communication Routine" V1.07):
  *
- * Vendor assumptions (recorded in detail in
- * /memories/session/phase2_zlac_assumptions.md — review against the
- * ZLAC8015D manual before robot bring-up):
+ *   * A SINGLE CANopen node (default ID 1, configurable via object
+ *     0x200A) provides both motor channels.  LEFT = sub-index 1,
+ *     RIGHT = sub-index 2 on every per-channel object (0x6064, 0x606C,
+ *     0x60FF, …).  Controlword (0x6040) and mode-of-operation (0x6060)
+ *     are single u16/u8 values that govern BOTH channels at once.
  *
- *   • Two CANopen nodes — node LEFT = CONFIG_ZLAC_NODE_LEFT,
- *     node RIGHT = CONFIG_ZLAC_NODE_RIGHT.
- *   • Profile Velocity mode (0x6060 = 3); target velocity via
- *     0x60FF in motor-shaft RPM (int32, signed = direction).
- *   • Encoder feedback via 0x6064 in counts; CPR is a Kconfig knob.
- *   • Velocity feedback via 0x606C in motor RPM.
- *   • PDO layout configured at init via SDO:
- *       RPDO1 (host→drive, cob = 0x200 + node):
- *           u16 controlword (0x6040,0) | i32 target_velocity (0x60FF,0)
- *       TPDO1 (drive→host, cob = 0x180 + node, transmission type 1):
- *           u16 statusword  (0x6041,0) | i32 position_actual (0x6064,0)
- *       TPDO2 (drive→host, cob = 0x280 + node, transmission type 1):
- *           i32 velocity_actual (0x606C,0) | i32 reserved
- *   • SYNC frame sent by us at 50 Hz to trigger TPDO transmission.
+ *   * Statusword 0x6041 is a U32: low 16 bits = LEFT axis, high 16 bits
+ *     = RIGHT axis.  Each half follows the standard CiA 402 state-word
+ *     bit layout (0x21 = RTSO, 0x23 = SO, 0x27 = OE, 0x40 = SOD, bit3
+ *     = fault).  See routine document §3.1 "Status word switching
+ *     state" — fully matches cia402.h decoder.
  *
- * Architecture
- * ────────────
- *   - canopen_init() handles TWAI bring-up.
- *   - At init we per-node:
- *       1. NMT reset_node, wait for heartbeat = BOOTUP (0)
- *       2. NMT enter pre-operational
- *       3. Disable PDOs (write valid=1 bit into cob-id), clear maps,
- *          install our mapping, re-enable PDOs.
- *       4. Configure Profile Velocity mode + accel/decel limits.
- *       5. NMT start (operational)
- *   - tx task @ 50 Hz: send SYNC + 2× RPDO1 (one per node).  Drives
- *     the CiA 402 state machine toward Operation Enabled (or
- *     Switch-On-Disabled when disarmed / e-stop).
- *   - rx via TPDO1/TPDO2 callbacks: updates per-axis caches and
- *     republishes motor_feedback_t once both axes have fresh data.
+ *   * Profile Velocity mode (0x6060 = 3) accepts targets at 0x60FF.
+ *     With speed-resolution 0x2026:05 = 1 (factory default) the raw
+ *     value is in motor RPM.  Range ±1000 r/min.  We use sub-indexes
+ *     1 (LEFT) and 2 (RIGHT) directly, each i32, mapped into RPDO1
+ *     as 8 data bytes (4 + 4 little-endian).
  *
- * What this file does NOT do (matches motor_driver_vesc.c):
- *   - cmd_vel arbitration, RC failsafe, tune override → motor_task.
- *   - Odometry integration → diff_drive + motor_task.
+ *   * Velocity feedback 0x606C is signed in 0.1 r/min units (sub 1 / 2,
+ *     each i32).  Firmware divides feedback by 10 before applying the
+ *     gear ratio.  Target commands stay in raw RPM.
  *
- * Compiled only when CONFIG_MOTOR_DRIVER_ZLAC8015D is selected.
+ *   * Position feedback 0x6064 is encoder counts (sub 1 / 2, each i32).
+ *     CONFIG_ZLAC_ENCODER_COUNTS_PER_REV is the counts/rev at the
+ *     motor shaft and equals 4 × (drive PPR 0x200E setting).  Default
+ *     factory PPR = 1024 → 4096 counts/rev.
+ *
+ *   * Accel/decel objects 0x6083/0x6084 are S-curve TIMES in
+ *     milliseconds (per QSG §9 object dictionary), NOT RPM/s.
+ *
+ *   * Heartbeat producer (0x1017, unit 0.5 ms) is disabled at factory
+ *     (value 0).  We enable it during bring-up.
+ *
+ *   * PDOs used here:
+ *       RPDO0  (cob 0x200 + node) — controlword (0x6040, default map)
+ *       RPDO1  (cob 0x300 + node) — target velocity LEFT (0x60FF:1)
+ *                                 + target velocity RIGHT (0x60FF:2)
+ *       TPDO0  (cob 0x180 + node) — statusword (0x6041, u32)
+ *       TPDO1  (cob 0x280 + node) — position LEFT + RIGHT
+ *       TPDO2  (cob 0x380 + node) — velocity LEFT + RIGHT
+ *     All asynchronous (transmission type 0xFF); TPDOs are timer-
+ *     triggered via 0x18xx:05 event timer (no SYNC frame needed).
+ *
+ * Author: outdoor-patrol firmware (auto-generated, see HISTORY.md).
  */
 
 #include "motor_driver.h"
 #include "motor_driver_zlac8015d.h"
+
 #include "canopen.h"
 #include "cia402.h"
-#include "sdkconfig.h"
-
-#include "esp_err.h"
-#include "esp_log.h"
-#include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/event_groups.h"
-#include "freertos/task.h"
 
 #include <inttypes.h>
-#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
-static const char *TAG = "motor_zlac";
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
+#include "sdkconfig.h"
 
-/* ── Hardware configuration (Kconfig-overridable) ───────────────── */
+#define TAG "zlac_drv"
 
-#ifndef CONFIG_ZLAC_CAN_TX_GPIO
-#define CONFIG_ZLAC_CAN_TX_GPIO  15
-#endif
-#ifndef CONFIG_ZLAC_CAN_RX_GPIO
-#define CONFIG_ZLAC_CAN_RX_GPIO  16
-#endif
-#ifndef CONFIG_ZLAC_NODE_LEFT
-#define CONFIG_ZLAC_NODE_LEFT    1
-#endif
-#ifndef CONFIG_ZLAC_NODE_RIGHT
-#define CONFIG_ZLAC_NODE_RIGHT   2
-#endif
-#ifndef CONFIG_ZLAC_ENCODER_CPR
-#define CONFIG_ZLAC_ENCODER_CPR  16384      /* 4096 lines × 4 quadrature */
-#endif
-#ifndef CONFIG_ZLAC_GEAR_RATIO_X100
-#define CONFIG_ZLAC_GEAR_RATIO_X100  100    /* 1.00 : direct drive */
-#endif
-#ifndef CONFIG_ZLAC_INVERT_LEFT
-#define CONFIG_ZLAC_INVERT_LEFT   0
-#endif
-#ifndef CONFIG_ZLAC_INVERT_RIGHT
-#define CONFIG_ZLAC_INVERT_RIGHT  0
-#endif
-#ifndef CONFIG_ZLAC_PROFILE_ACCEL
-#define CONFIG_ZLAC_PROFILE_ACCEL  500      /* RPM/s (motor) */
-#endif
-#ifndef CONFIG_ZLAC_PROFILE_DECEL
-#define CONFIG_ZLAC_PROFILE_DECEL  500
-#endif
+/* ---- object dictionary indexes ---------------------------------------- */
 
-#define ZLAC_NUM_AXES            2
-#define ZLAC_AXIS_LEFT           0
-#define ZLAC_AXIS_RIGHT          1
+#define OD_HEARTBEAT_TIME       0x1017  /* u16, unit 0.5 ms                */
+#define OD_RPDO_COMM_BASE       0x1400  /* +n */
+#define OD_RPDO_MAP_BASE        0x1600  /* +n */
+#define OD_TPDO_COMM_BASE       0x1800  /* +n */
+#define OD_TPDO_MAP_BASE        0x1A00  /* +n */
+#define OD_FAULT_CODE           0x603F  /* u32 (low16=L, high16=R)         */
+#define OD_CONTROLWORD          0x6040  /* u16, shared                     */
+#define OD_STATUSWORD           0x6041  /* u32 (low16=L, high16=R)         */
+#define OD_MODES_OF_OPERATION   0x6060  /* i8,  shared                     */
+#define OD_POSITION_ACTUAL      0x6064  /* i32, sub1=L sub2=R              */
+#define OD_VELOCITY_ACTUAL      0x606C  /* i32, sub1=L sub2=R (0.1 RPM)    */
+#define OD_ACCEL_TIME           0x6083  /* u32, sub1=L sub2=R (ms)         */
+#define OD_DECEL_TIME           0x6084  /* u32, sub1=L sub2=R (ms)         */
+#define OD_TARGET_VELOCITY      0x60FF  /* i32, sub1=L sub2=R (RPM)        */
 
-#define ZLAC_TX_PERIOD_MS        20         /* 50 Hz */
-#define ZLAC_TX_TASK_STACK       4096
-#define ZLAC_TX_TASK_PRIO        5
-#define ZLAC_TX_TASK_CORE        1
+#define MODE_PROFILE_VELOCITY   3
 
-#define ZLAC_BOOT_TIMEOUT_MS     3000
-#define ZLAC_HEARTBEAT_TIMEOUT_MS  500
-#define ZLAC_TPDO_TIMEOUT_MS     200
-#define ZLAC_SDO_TIMEOUT_MS      200
+#define AXIS_LEFT               0
+#define AXIS_RIGHT              1
+#define NUM_AXES                2
 
-/* CiA 402 object indices (standard) */
-#define OBJ_CONTROLWORD          0x6040
-#define OBJ_STATUSWORD           0x6041
-#define OBJ_MODES_OF_OPERATION   0x6060
-#define OBJ_POSITION_ACTUAL      0x6064
-#define OBJ_VELOCITY_ACTUAL      0x606C
-#define OBJ_TARGET_VELOCITY      0x60FF
-#define OBJ_PROFILE_ACCEL        0x6083
-#define OBJ_PROFILE_DECEL        0x6084
+/* Encode an entry for the PDO mapping table (CiA 301 §7.4.6): the U32
+ * value stored in 0x1600/0x1A00 sub-indexes is
+ *   bits 31..16 = object index
+ *   bits 15..8  = sub-index
+ *   bits  7..0  = bit length
+ */
+#define PDO_MAP_ENTRY(idx, sub, bits)                                          \
+    (((uint32_t)(idx) << 16) | ((uint32_t)(sub) << 8) | (uint32_t)(bits))
 
-/* PDO communication-parameter and mapping-parameter indices */
-#define OBJ_RPDO1_COMM           0x1400
-#define OBJ_RPDO1_MAP            0x1600
-#define OBJ_TPDO1_COMM           0x1800
-#define OBJ_TPDO1_MAP            0x1A00
-#define OBJ_TPDO2_COMM           0x1801
-#define OBJ_TPDO2_MAP            0x1A01
+/* ---- compile-time configuration --------------------------------------- */
 
-/* ── Static node table ──────────────────────────────────────────── */
+#define ZLAC_NODE               CONFIG_ZLAC_NODE_ID
+#define ZLAC_COUNTS_PER_REV     CONFIG_ZLAC_ENCODER_COUNTS_PER_REV
+#define ZLAC_GEAR_X100          CONFIG_ZLAC_GEAR_RATIO_X100
+#define ZLAC_ACCEL_MS           CONFIG_ZLAC_PROFILE_ACCEL_MS
+#define ZLAC_DECEL_MS           CONFIG_ZLAC_PROFILE_DECEL_MS
+#define ZLAC_HEARTBEAT_MS       CONFIG_ZLAC_HEARTBEAT_INTERVAL_MS
+#define ZLAC_TPDO_EVENT_MS      CONFIG_ZLAC_TPDO_EVENT_MS
+#define ZLAC_TX_GPIO            CONFIG_ZLAC_CAN_TX_GPIO
+#define ZLAC_RX_GPIO            CONFIG_ZLAC_CAN_RX_GPIO
 
-static const uint8_t s_node_id[ZLAC_NUM_AXES] = {
-    [ZLAC_AXIS_LEFT]  = CONFIG_ZLAC_NODE_LEFT,
-    [ZLAC_AXIS_RIGHT] = CONFIG_ZLAC_NODE_RIGHT,
-};
-static const int s_invert[ZLAC_NUM_AXES] = {
-    [ZLAC_AXIS_LEFT]  = CONFIG_ZLAC_INVERT_LEFT  ? -1 : +1,
-    [ZLAC_AXIS_RIGHT] = CONFIG_ZLAC_INVERT_RIGHT ? -1 : +1,
-};
+#define ZLAC_TX_TICK_MS         20U    /* RPDO refresh cadence */
+#define ZLAC_HEARTBEAT_TIMEOUT  500U   /* declare offline after (ms) */
+#define ZLAC_TPDO_TIMEOUT       200U   /* feedback freshness threshold */
 
-/* ── Shared state (spinlock-protected, never blocks) ────────────── */
+/* ---- backend state ---------------------------------------------------- */
 
-static portMUX_TYPE      s_cmd_mux = portMUX_INITIALIZER_UNLOCKED;
-static motor_wheel_cmd_t s_cmd;             /* latest setpoint */
-static bool              s_estop;
-
-static portMUX_TYPE     s_axis_mux = portMUX_INITIALIZER_UNLOCKED;
 typedef struct {
-    /* Last TPDO observations */
-    uint16_t statusword;
-    int32_t  position_counts;
-    int32_t  velocity_motor_rpm;
-    uint32_t last_tpdo_ms;
-    bool     tpdo_seen;
+    bool             invert;
+    int32_t          target_motor_rpm;   /* setpoint after sign/clamp */
+    int32_t          actual_motor_rpm;   /* feedback                  */
+    int32_t          position_counts;
+    uint16_t         statusword;
+    cia402_state_t   state;
+    uint32_t         last_tpdo_ms;
+    bool             tpdo_seen;
+} axis_state_t;
 
-    /* Last command we transmitted (debug only) */
-    int32_t  cmd_velocity_motor_rpm;
-    uint16_t cmd_controlword;
-} zlac_axis_state_t;
-static zlac_axis_state_t s_axis[ZLAC_NUM_AXES];
+static SemaphoreHandle_t s_lock;
+static TaskHandle_t      s_tx_task;
+static bool              s_initialised;
+static bool              s_boot_passed;
 
-static portMUX_TYPE     s_feedback_mux = portMUX_INITIALIZER_UNLOCKED;
-static motor_feedback_t s_feedback;
-static bool             s_feedback_valid;
+/* Wheel-side command set by motor_driver_set_cmd() */
+static motor_wheel_cmd_t s_cmd;
+static bool              s_estop;     /* sticky until next set_cmd */
+static bool              s_prev_cw_had_reset;
 
-static portMUX_TYPE     s_health_mux = portMUX_INITIALIZER_UNLOCKED;
-static motor_health_t   s_health;        /* updated from tx task */
+static axis_state_t      s_axes[NUM_AXES];
 
-#define BIT_ARMED   (1u << 0)
-static EventGroupHandle_t s_events;
+/* Heartbeat snapshot maintained by tx_task */
+static uint32_t            s_last_heartbeat_ms;
+static bool                s_heartbeat_seen;
 
-/* ── Helpers ─────────────────────────────────────────────────────── */
+/* ---- utility ---------------------------------------------------------- */
 
 static inline uint32_t now_ms(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000);
 }
 
-static inline float counts_per_wheel_rev(void)
+static inline int32_t motor_rpm_to_wheel_rpm(int32_t mrpm)
 {
-    /* Wheel rev = motor rev (direct drive) × gear ratio.  CPR is in
-     * motor-shaft counts/rev.  Wheel counts = motor_counts × gear. */
-    return (float)CONFIG_ZLAC_ENCODER_CPR *
-           ((float)CONFIG_ZLAC_GEAR_RATIO_X100 / 100.0f);
+    return (int32_t)((int64_t)mrpm * 100 / ZLAC_GEAR_X100);
 }
 
-static inline float gear_ratio_f(void)
+static inline int32_t wheel_rpm_to_motor_rpm(int32_t wrpm)
 {
-    return (float)CONFIG_ZLAC_GEAR_RATIO_X100 / 100.0f;
+    return (int32_t)((int64_t)wrpm * ZLAC_GEAR_X100 / 100);
 }
 
-/* Wheel RPM → motor-shaft RPM. */
-static inline int32_t wheel_rpm_to_motor_rpm(float wheel_rpm, int axis)
+static inline int32_t counts_per_wheel_rev(void)
 {
-    float motor = wheel_rpm * gear_ratio_f() * (float)s_invert[axis];
-    /* Round half-away-from-zero */
-    return (int32_t)(motor + (motor >= 0.0f ? 0.5f : -0.5f));
+    return (int32_t)((int64_t)ZLAC_COUNTS_PER_REV * ZLAC_GEAR_X100 / 100);
 }
 
-/* Encoder counts (signed, motor-side) → wheel revolutions. */
-static inline float counts_to_wheel_revs(int32_t counts, int axis)
+/* ---- TPDO receive callbacks ------------------------------------------- */
+
+static void on_tpdo_statusword(uint32_t cob_id, const uint8_t *data,
+                               uint8_t dlc, void *ctx)
 {
-    float revs = (float)counts / counts_per_wheel_rev();
-    return revs * (float)s_invert[axis];
-}
-
-/* Motor RPM → wheel RPM. */
-static inline float motor_rpm_to_wheel_rpm(int32_t motor_rpm, int axis)
-{
-    return ((float)motor_rpm / gear_ratio_f()) * (float)s_invert[axis];
-}
-
-/* ── PDO mapping installation (SDO) ─────────────────────────────── */
-
-/*
- * Each call sequence below mirrors the standard "disable PDO →
- * clear mapping → install new mapping → enable PDO" pattern.
- * On any error we log and return — the boot health check will
- * report the affected axis as down.
- */
-
-#define MAP_ENTRY(idx, sub, bits)  \
-    (((uint32_t)(idx) << 16) | ((uint32_t)(sub) << 8) | ((uint32_t)(bits)))
-
-static esp_err_t configure_rpdo1(uint8_t node)
-{
-    esp_err_t r;
-    /* 1. Disable the PDO (set MSB of COB-ID in 0x1400,1) */
-    r = canopen_sdo_write_u32(node, OBJ_RPDO1_COMM, 1,
-            0x80000000u | (uint32_t)(CANOPEN_COB_RPDO1_BASE + node),
-            ZLAC_SDO_TIMEOUT_MS);
-    if (r != ESP_OK) return r;
-    /* 2. Clear the mapping count */
-    r = canopen_sdo_write_u8(node, OBJ_RPDO1_MAP, 0, 0, ZLAC_SDO_TIMEOUT_MS);
-    if (r != ESP_OK) return r;
-    /* 3. Install entries: controlword (16 bit) then target_velocity (32 bit) */
-    r = canopen_sdo_write_u32(node, OBJ_RPDO1_MAP, 1,
-            MAP_ENTRY(OBJ_CONTROLWORD,    0, 16), ZLAC_SDO_TIMEOUT_MS);
-    if (r != ESP_OK) return r;
-    r = canopen_sdo_write_u32(node, OBJ_RPDO1_MAP, 2,
-            MAP_ENTRY(OBJ_TARGET_VELOCITY, 0, 32), ZLAC_SDO_TIMEOUT_MS);
-    if (r != ESP_OK) return r;
-    /* 4. Set mapping count = 2 */
-    r = canopen_sdo_write_u8(node, OBJ_RPDO1_MAP, 0, 2, ZLAC_SDO_TIMEOUT_MS);
-    if (r != ESP_OK) return r;
-    /* 5. Set transmission type = 255 (async, on receipt) */
-    r = canopen_sdo_write_u8(node, OBJ_RPDO1_COMM, 2, 0xFF,
-            ZLAC_SDO_TIMEOUT_MS);
-    if (r != ESP_OK) return r;
-    /* 6. Re-enable PDO (clear MSB of COB-ID) */
-    r = canopen_sdo_write_u32(node, OBJ_RPDO1_COMM, 1,
-            (uint32_t)(CANOPEN_COB_RPDO1_BASE + node),
-            ZLAC_SDO_TIMEOUT_MS);
-    return r;
-}
-
-static esp_err_t configure_tpdo(uint8_t node,
-                                uint16_t comm_idx, uint16_t map_idx,
-                                uint32_t cob_base,
-                                uint32_t entry_a, uint32_t entry_b)
-{
-    esp_err_t r;
-    /* Disable */
-    r = canopen_sdo_write_u32(node, comm_idx, 1,
-            0x80000000u | (uint32_t)(cob_base + node),
-            ZLAC_SDO_TIMEOUT_MS);
-    if (r != ESP_OK) return r;
-    /* Clear map */
-    r = canopen_sdo_write_u8(node, map_idx, 0, 0, ZLAC_SDO_TIMEOUT_MS);
-    if (r != ESP_OK) return r;
-    r = canopen_sdo_write_u32(node, map_idx, 1, entry_a, ZLAC_SDO_TIMEOUT_MS);
-    if (r != ESP_OK) return r;
-    r = canopen_sdo_write_u32(node, map_idx, 2, entry_b, ZLAC_SDO_TIMEOUT_MS);
-    if (r != ESP_OK) return r;
-    r = canopen_sdo_write_u8(node, map_idx, 0, 2, ZLAC_SDO_TIMEOUT_MS);
-    if (r != ESP_OK) return r;
-    /* Transmission type = 1 (every SYNC) */
-    r = canopen_sdo_write_u8(node, comm_idx, 2, 1, ZLAC_SDO_TIMEOUT_MS);
-    if (r != ESP_OK) return r;
-    /* Re-enable */
-    r = canopen_sdo_write_u32(node, comm_idx, 1,
-            (uint32_t)(cob_base + node), ZLAC_SDO_TIMEOUT_MS);
-    return r;
-}
-
-/* ── PDO RX callbacks ───────────────────────────────────────────── */
-
-static void on_tpdo1(uint32_t cob_id, const uint8_t *data, uint8_t dlc, void *ctx)
-{
-    int axis = (int)(intptr_t)ctx;
-    if (dlc < 6) return;
-    uint16_t sw = (uint16_t)data[0] | ((uint16_t)data[1] << 8);
-    int32_t  pos = (int32_t)((uint32_t)data[2]
-                           | ((uint32_t)data[3] << 8)
-                           | ((uint32_t)data[4] << 16)
-                           | ((uint32_t)data[5] << 24));
-    uint32_t t = now_ms();
-    taskENTER_CRITICAL(&s_axis_mux);
-    s_axis[axis].statusword      = sw;
-    s_axis[axis].position_counts = pos;
-    s_axis[axis].last_tpdo_ms    = t;
-    s_axis[axis].tpdo_seen       = true;
-    taskEXIT_CRITICAL(&s_axis_mux);
-    (void)cob_id;
-}
-
-static void on_tpdo2(uint32_t cob_id, const uint8_t *data, uint8_t dlc, void *ctx)
-{
-    int axis = (int)(intptr_t)ctx;
+    (void)cob_id; (void)ctx;
     if (dlc < 4) return;
-    int32_t v = (int32_t)((uint32_t)data[0]
-                        | ((uint32_t)data[1] << 8)
-                        | ((uint32_t)data[2] << 16)
-                        | ((uint32_t)data[3] << 24));
-    taskENTER_CRITICAL(&s_axis_mux);
-    s_axis[axis].velocity_motor_rpm = v;
-    taskEXIT_CRITICAL(&s_axis_mux);
-    (void)cob_id;
+    uint32_t sw32 = (uint32_t)data[0] | ((uint32_t)data[1] << 8)
+                  | ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
+    uint16_t sw_l = (uint16_t)(sw32 & 0xFFFF);
+    uint16_t sw_r = (uint16_t)((sw32 >> 16) & 0xFFFF);
+    uint32_t t = now_ms();
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_axes[AXIS_LEFT].statusword   = sw_l;
+    s_axes[AXIS_LEFT].state        = cia402_decode_state(sw_l);
+    s_axes[AXIS_LEFT].last_tpdo_ms = t;
+    s_axes[AXIS_LEFT].tpdo_seen    = true;
+    s_axes[AXIS_RIGHT].statusword   = sw_r;
+    s_axes[AXIS_RIGHT].state        = cia402_decode_state(sw_r);
+    s_axes[AXIS_RIGHT].last_tpdo_ms = t;
+    s_axes[AXIS_RIGHT].tpdo_seen    = true;
+    xSemaphoreGive(s_lock);
 }
 
-static esp_err_t register_axis_callbacks(int axis)
+static void on_tpdo_positions(uint32_t cob_id, const uint8_t *data,
+                              uint8_t dlc, void *ctx)
 {
-    uint8_t node = s_node_id[axis];
-    esp_err_t r;
-    r = canopen_register_pdo_cb(CANOPEN_COB_TPDO1_BASE + node,
-                                on_tpdo1, (void *)(intptr_t)axis);
-    if (r != ESP_OK) return r;
-    r = canopen_register_pdo_cb(CANOPEN_COB_TPDO2_BASE + node,
-                                on_tpdo2, (void *)(intptr_t)axis);
-    return r;
+    (void)cob_id; (void)ctx;
+    if (dlc < 8) return;
+    int32_t pos_l, pos_r;
+    memcpy(&pos_l, &data[0], 4);
+    memcpy(&pos_r, &data[4], 4);
+    uint32_t t = now_ms();
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_axes[AXIS_LEFT].position_counts  = s_axes[AXIS_LEFT].invert  ? -pos_l : pos_l;
+    s_axes[AXIS_RIGHT].position_counts = s_axes[AXIS_RIGHT].invert ? -pos_r : pos_r;
+    s_axes[AXIS_LEFT].last_tpdo_ms     = t;
+    s_axes[AXIS_RIGHT].last_tpdo_ms    = t;
+    xSemaphoreGive(s_lock);
 }
 
-/* ── Feedback publishing ────────────────────────────────────────── */
-
-static void publish_feedback(uint32_t t_ms)
+static void on_tpdo_velocities(uint32_t cob_id, const uint8_t *data,
+                               uint8_t dlc, void *ctx)
 {
-    motor_feedback_t fb;
-    zlac_axis_state_t a[ZLAC_NUM_AXES];
-    taskENTER_CRITICAL(&s_axis_mux);
-    a[0] = s_axis[0];
-    a[1] = s_axis[1];
-    taskEXIT_CRITICAL(&s_axis_mux);
+    (void)cob_id; (void)ctx;
+    if (dlc < 8) return;
+    int32_t vel_l_decirpm, vel_r_decirpm;
+    memcpy(&vel_l_decirpm, &data[0], 4);
+    memcpy(&vel_r_decirpm, &data[4], 4);
+    /* Object 0x606C unit is 0.1 r/min — convert to integer RPM. */
+    int32_t vel_l = vel_l_decirpm / 10;
+    int32_t vel_r = vel_r_decirpm / 10;
+    uint32_t t = now_ms();
 
-    fb.left.rpm           = motor_rpm_to_wheel_rpm(a[0].velocity_motor_rpm, 0);
-    fb.left.revolutions   = counts_to_wheel_revs(a[0].position_counts, 0);
-    fb.left.current_a     = 0.0f;
-    fb.left.fault_code_raw = a[0].statusword;
-    fb.left.fault_bits     = (a[0].statusword & CIA402_SW_FAULT)
-                                ? MOTOR_FAULT_OTHER : 0;
-
-    fb.right.rpm          = motor_rpm_to_wheel_rpm(a[1].velocity_motor_rpm, 1);
-    fb.right.revolutions  = counts_to_wheel_revs(a[1].position_counts, 1);
-    fb.right.current_a    = 0.0f;
-    fb.right.fault_code_raw = a[1].statusword;
-    fb.right.fault_bits     = (a[1].statusword & CIA402_SW_FAULT)
-                                ? MOTOR_FAULT_OTHER : 0;
-
-    /* The standard CiA 402 object dictionary has no required bus-
-     * voltage entry; vendor extension would map it via TPDO3 in a
-     * future iteration.  Leave at 0 for now. */
-    fb.bus_voltage_v  = 0.0f;
-    fb.last_update_ms = t_ms;
-
-    taskENTER_CRITICAL(&s_feedback_mux);
-    s_feedback       = fb;
-    s_feedback_valid = true;
-    taskEXIT_CRITICAL(&s_feedback_mux);
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_axes[AXIS_LEFT].actual_motor_rpm  = s_axes[AXIS_LEFT].invert  ? -vel_l : vel_l;
+    s_axes[AXIS_RIGHT].actual_motor_rpm = s_axes[AXIS_RIGHT].invert ? -vel_r : vel_r;
+    s_axes[AXIS_LEFT].last_tpdo_ms      = t;
+    s_axes[AXIS_RIGHT].last_tpdo_ms     = t;
+    xSemaphoreGive(s_lock);
 }
 
-/* ── Health watchdog ────────────────────────────────────────────── */
+/* ---- bring-up: configure the drive once over SDO --------------------- */
 
-static bool axis_online(int axis, uint32_t t_ms)
+static bool sdo_w16(uint16_t idx, uint8_t sub, uint16_t v)
 {
-    /* Heartbeat present and within timeout */
-    canopen_nmt_state_t hb_state;
-    uint32_t hb_last;
-    if (!canopen_get_heartbeat(s_node_id[axis], &hb_state, &hb_last)) {
-        return false;
+    return canopen_sdo_write_u16(ZLAC_NODE, idx, sub, v, 0) == ESP_OK;
+}
+static bool sdo_w32(uint16_t idx, uint8_t sub, uint32_t v)
+{
+    return canopen_sdo_write_u32(ZLAC_NODE, idx, sub, v, 0) == ESP_OK;
+}
+static bool sdo_w8(uint16_t idx, uint8_t sub, uint8_t v)
+{
+    return canopen_sdo_write_u8(ZLAC_NODE, idx, sub, v, 0) == ESP_OK;
+}
+static bool sdo_wi8(uint16_t idx, uint8_t sub, int8_t v)
+{
+    return canopen_sdo_write_i8(ZLAC_NODE, idx, sub, v, 0) == ESP_OK;
+}
+
+static bool configure_rpdo(uint8_t pdo_idx,
+                           const uint32_t *entries, uint8_t n_entries)
+{
+    /* CiA 301 PDO config sequence:
+     *   1. disable PDO    (set comm-param sub1 high bit = 1)
+     *   2. clear mapping  (write 0 to map-param sub0)
+     *   3. write entries  (sub1..n)
+     *   4. set sub0 = n
+     *   5. set tx-type   (sub2 of comm-param)
+     *   6. re-enable PDO (clear high bit in comm-param sub1)
+     */
+    uint16_t comm = OD_RPDO_COMM_BASE + pdo_idx;
+    uint16_t map  = OD_RPDO_MAP_BASE  + pdo_idx;
+    uint32_t cob  = (pdo_idx == 0 ? 0x200u :
+                     pdo_idx == 1 ? 0x300u :
+                     pdo_idx == 2 ? 0x400u : 0x500u) + ZLAC_NODE;
+    if (!sdo_w32(comm, 1, cob | 0x80000000u)) return false;
+    if (!sdo_w8 (map,  0, 0))                 return false;
+    for (uint8_t i = 0; i < n_entries; ++i) {
+        if (!sdo_w32(map, i + 1, entries[i])) return false;
     }
-    if ((t_ms - hb_last) > ZLAC_HEARTBEAT_TIMEOUT_MS) return false;
-    if (hb_state != CANOPEN_NMT_STATE_OPERATIONAL) return false;
-
-    bool fresh; uint16_t sw;
-    taskENTER_CRITICAL(&s_axis_mux);
-    fresh = s_axis[axis].tpdo_seen &&
-            ((t_ms - s_axis[axis].last_tpdo_ms) <= ZLAC_TPDO_TIMEOUT_MS);
-    sw = s_axis[axis].statusword;
-    taskEXIT_CRITICAL(&s_axis_mux);
-    if (!fresh) return false;
-    if (sw & CIA402_SW_FAULT) return false;
+    if (!sdo_w8 (map,  0, n_entries))         return false;
+    if (!sdo_w8 (comm, 2, 0xFF))              return false;  /* async */
+    if (!sdo_w32(comm, 1, cob))               return false;
     return true;
 }
 
-/* ── TX task: CiA 402 driver + SYNC + RPDO transmit ─────────────── */
-
-static void encode_rpdo1(uint16_t controlword, int32_t target_vel,
-                         uint8_t out[6])
+static bool configure_tpdo(uint8_t pdo_idx,
+                           const uint32_t *entries, uint8_t n_entries,
+                           uint16_t event_timer_halfms)
 {
-    out[0] = (uint8_t)(controlword & 0xFF);
-    out[1] = (uint8_t)((controlword >> 8) & 0xFF);
-    out[2] = (uint8_t)((uint32_t)target_vel & 0xFF);
-    out[3] = (uint8_t)(((uint32_t)target_vel >> 8) & 0xFF);
-    out[4] = (uint8_t)(((uint32_t)target_vel >> 16) & 0xFF);
-    out[5] = (uint8_t)(((uint32_t)target_vel >> 24) & 0xFF);
+    uint16_t comm = OD_TPDO_COMM_BASE + pdo_idx;
+    uint16_t map  = OD_TPDO_MAP_BASE  + pdo_idx;
+    uint32_t cob  = (pdo_idx == 0 ? 0x180u :
+                     pdo_idx == 1 ? 0x280u :
+                     pdo_idx == 2 ? 0x380u : 0x480u) + ZLAC_NODE;
+    if (!sdo_w32(comm, 1, cob | 0x80000000u)) return false;
+    if (!sdo_w8 (map,  0, 0))                 return false;
+    for (uint8_t i = 0; i < n_entries; ++i) {
+        if (!sdo_w32(map, i + 1, entries[i])) return false;
+    }
+    if (!sdo_w8 (map,  0, n_entries))         return false;
+    if (!sdo_w8 (comm, 2, 0xFF))              return false;  /* async */
+    if (!sdo_w16(comm, 5, event_timer_halfms))return false;
+    if (!sdo_w32(comm, 1, cob))               return false;
+    return true;
 }
 
-static void zlac_tx_task(void *arg)
+static bool bring_up_drive(void)
 {
-    TickType_t last_wake = xTaskGetTickCount();
-    /* Track previous controlword bit-7 per axis to produce a rising
-     * edge for fault-reset. */
-    bool prev_cw_reset[ZLAC_NUM_AXES] = { false, false };
+    ESP_LOGI(TAG, "ZLAC bring-up: NMT reset node %u", (unsigned)ZLAC_NODE);
+    canopen_nmt_send(CANOPEN_NMT_RESET_NODE, ZLAC_NODE);
+    vTaskDelay(pdMS_TO_TICKS(500));   /* wait for boot-up */
 
-    for (;;) {
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(ZLAC_TX_PERIOD_MS));
+    /* Heartbeat producer */
+    if (!sdo_w16(OD_HEARTBEAT_TIME, 0,
+                 (uint16_t)(ZLAC_HEARTBEAT_MS * 2))) {
+        ESP_LOGE(TAG, "set 0x1017 failed");
+        return false;
+    }
 
-        uint32_t t = now_ms();
+    /* Profile-velocity mode */
+    if (!sdo_wi8(OD_MODES_OF_OPERATION, 0, MODE_PROFILE_VELOCITY)) {
+        ESP_LOGE(TAG, "set 0x6060 failed");
+        return false;
+    }
 
-        /* Latch upper-layer command + e-stop */
-        motor_wheel_cmd_t cmd_local;
-        bool estop_local;
-        taskENTER_CRITICAL(&s_cmd_mux);
-        cmd_local   = s_cmd;
-        estop_local = s_estop;
-        taskEXIT_CRITICAL(&s_cmd_mux);
+    /* Accel / decel times (ms) — set both channels */
+    if (!sdo_w32(OD_ACCEL_TIME, 1, ZLAC_ACCEL_MS) ||
+        !sdo_w32(OD_ACCEL_TIME, 2, ZLAC_ACCEL_MS) ||
+        !sdo_w32(OD_DECEL_TIME, 1, ZLAC_DECEL_MS) ||
+        !sdo_w32(OD_DECEL_TIME, 2, ZLAC_DECEL_MS)) {
+        ESP_LOGE(TAG, "set 0x6083/0x6084 failed");
+        return false;
+    }
 
-        bool armed = (xEventGroupGetBits(s_events) & BIT_ARMED) != 0;
+    /* Zero initial targets */
+    sdo_w32(OD_TARGET_VELOCITY, 1, 0);
+    sdo_w32(OD_TARGET_VELOCITY, 2, 0);
 
-        /* Per-axis health (drives target-state choice) */
-        bool axis_ok[ZLAC_NUM_AXES] = {
-            axis_online(0, t),
-            axis_online(1, t),
+    /* RPDO0 — keep default mapping (controlword 16-bit on 0x200+node) */
+
+    /* RPDO1 — two target velocities */
+    {
+        const uint32_t map[2] = {
+            PDO_MAP_ENTRY(OD_TARGET_VELOCITY, 1, 32),
+            PDO_MAP_ENTRY(OD_TARGET_VELOCITY, 2, 32),
         };
-        bool all_ok = axis_ok[0] && axis_ok[1];
-
-        /* If anything is wrong, target is Switch On Disabled (motor
-         * de-energised — safest stop).  Otherwise drive to OE. */
-        cia402_state_t target = (armed && !estop_local && all_ok)
-            ? CIA402_STATE_OPERATION_ENABLED
-            : CIA402_STATE_SWITCH_ON_DISABLED;
-
-        /* Always send SYNC first so TPDOs latch the prior tick's
-         * statuswords before we read them next cycle. */
-        (void)canopen_sync_send();
-
-        for (int axis = 0; axis < ZLAC_NUM_AXES; axis++) {
-            uint8_t node = s_node_id[axis];
-
-            uint16_t sw;
-            taskENTER_CRITICAL(&s_axis_mux);
-            sw = s_axis[axis].statusword;
-            taskEXIT_CRITICAL(&s_axis_mux);
-            cia402_state_t cur = cia402_decode_state(sw);
-
-            uint16_t cw = cia402_next_controlword(cur, target,
-                                                  prev_cw_reset[axis]);
-            prev_cw_reset[axis] = (cw & 0x80) != 0;
-
-            int32_t target_vel = 0;
-            if (target == CIA402_STATE_OPERATION_ENABLED &&
-                cur == CIA402_STATE_OPERATION_ENABLED) {
-                float w = (axis == ZLAC_AXIS_LEFT)
-                    ? cmd_local.left_rpm
-                    : cmd_local.right_rpm;
-                target_vel = wheel_rpm_to_motor_rpm(w, axis);
-            }
-
-            uint8_t pdu[6];
-            encode_rpdo1(cw, target_vel, pdu);
-            (void)canopen_send_pdo(CANOPEN_COB_RPDO1_BASE + node, pdu, 6);
-
-            taskENTER_CRITICAL(&s_axis_mux);
-            s_axis[axis].cmd_controlword         = cw;
-            s_axis[axis].cmd_velocity_motor_rpm  = target_vel;
-            taskEXIT_CRITICAL(&s_axis_mux);
-        }
-
-        /* Update health snapshot */
-        uint32_t fault_bits = 0;
-        if (!axis_ok[0]) fault_bits |= MOTOR_FAULT_COMMUNICATION;
-        if (!axis_ok[1]) fault_bits |= MOTOR_FAULT_COMMUNICATION;
-        uint16_t sw0, sw1;
-        taskENTER_CRITICAL(&s_axis_mux);
-        sw0 = s_axis[0].statusword;
-        sw1 = s_axis[1].statusword;
-        taskEXIT_CRITICAL(&s_axis_mux);
-        if (sw0 & CIA402_SW_FAULT) fault_bits |= MOTOR_FAULT_OTHER;
-        if (sw1 & CIA402_SW_FAULT) fault_bits |= MOTOR_FAULT_OTHER;
-
-        taskENTER_CRITICAL(&s_health_mux);
-        s_health.online      = all_ok;
-        /* boot_passed is sticky — set by init, never cleared here. */
-        s_health.fault_bits  = fault_bits;
-        taskEXIT_CRITICAL(&s_health_mux);
-
-        /* Publish feedback once per tick (cheap; consumer reads
-         * via spinlock).  Skip the lock if neither axis has data. */
-        bool any_data;
-        taskENTER_CRITICAL(&s_axis_mux);
-        any_data = s_axis[0].tpdo_seen || s_axis[1].tpdo_seen;
-        taskEXIT_CRITICAL(&s_axis_mux);
-        if (any_data) publish_feedback(t);
-
-        /* Rate-limited debug */
-        static TickType_t s_last_dbg;
-        if ((xTaskGetTickCount() - s_last_dbg) >= pdMS_TO_TICKS(1000)) {
-            zlac_axis_state_t a[ZLAC_NUM_AXES];
-            taskENTER_CRITICAL(&s_axis_mux);
-            a[0] = s_axis[0]; a[1] = s_axis[1];
-            taskEXIT_CRITICAL(&s_axis_mux);
-            ESP_LOGI(TAG,
-                "tx: armed=%d estop=%d L[%s sw=0x%04X cw=0x%04X tgt=%" PRId32
-                " act=%" PRId32 "] R[%s sw=0x%04X cw=0x%04X tgt=%" PRId32
-                " act=%" PRId32 "]",
-                armed, estop_local,
-                cia402_state_name(cia402_decode_state(a[0].statusword)),
-                a[0].statusword, a[0].cmd_controlword,
-                a[0].cmd_velocity_motor_rpm, a[0].velocity_motor_rpm,
-                cia402_state_name(cia402_decode_state(a[1].statusword)),
-                a[1].statusword, a[1].cmd_controlword,
-                a[1].cmd_velocity_motor_rpm, a[1].velocity_motor_rpm);
-            s_last_dbg = xTaskGetTickCount();
+        if (!configure_rpdo(1, map, 2)) {
+            ESP_LOGE(TAG, "RPDO1 config failed");
+            return false;
         }
     }
-}
 
-/* ── Per-axis init (NMT + SDO config) ───────────────────────────── */
+    uint16_t event_timer_halfms = (uint16_t)(ZLAC_TPDO_EVENT_MS * 2);
 
-static esp_err_t wait_heartbeat(uint8_t node, canopen_nmt_state_t want,
-                                uint32_t timeout_ms)
-{
-    uint32_t deadline = now_ms() + timeout_ms;
-    while ((int32_t)(deadline - now_ms()) > 0) {
-        canopen_nmt_state_t s;
-        uint32_t ts;
-        if (canopen_get_heartbeat(node, &s, &ts) && s == want) {
-            return ESP_OK;
+    /* TPDO0 — statusword (u32) */
+    {
+        const uint32_t map[1] = {
+            PDO_MAP_ENTRY(OD_STATUSWORD, 0, 32),
+        };
+        if (!configure_tpdo(0, map, 1, event_timer_halfms)) {
+            ESP_LOGE(TAG, "TPDO0 config failed");
+            return false;
         }
-        vTaskDelay(pdMS_TO_TICKS(20));
     }
-    return ESP_ERR_TIMEOUT;
-}
-
-static esp_err_t bring_up_axis(int axis)
-{
-    uint8_t node = s_node_id[axis];
-    esp_err_t r;
-
-    ESP_LOGI(TAG, "axis %d: NMT reset_node (node %u)", axis, node);
-    r = canopen_nmt_send(CANOPEN_NMT_RESET_NODE, node);
-    if (r != ESP_OK) return r;
-
-    r = wait_heartbeat(node, CANOPEN_NMT_STATE_BOOTUP, ZLAC_BOOT_TIMEOUT_MS);
-    if (r != ESP_OK) {
-        ESP_LOGW(TAG, "axis %d: no boot-up heartbeat from node %u", axis, node);
-        /* Continue anyway — some drives skip the explicit boot-up
-         * frame and jump straight to pre-operational. */
+    /* TPDO1 — positions L/R */
+    {
+        const uint32_t map[2] = {
+            PDO_MAP_ENTRY(OD_POSITION_ACTUAL, 1, 32),
+            PDO_MAP_ENTRY(OD_POSITION_ACTUAL, 2, 32),
+        };
+        if (!configure_tpdo(1, map, 2, event_timer_halfms)) {
+            ESP_LOGE(TAG, "TPDO1 config failed");
+            return false;
+        }
+    }
+    /* TPDO2 — velocities L/R */
+    {
+        const uint32_t map[2] = {
+            PDO_MAP_ENTRY(OD_VELOCITY_ACTUAL, 1, 32),
+            PDO_MAP_ENTRY(OD_VELOCITY_ACTUAL, 2, 32),
+        };
+        if (!configure_tpdo(2, map, 2, event_timer_halfms)) {
+            ESP_LOGE(TAG, "TPDO2 config failed");
+            return false;
+        }
     }
 
-    r = canopen_nmt_send(CANOPEN_NMT_ENTER_PREOP, node);
-    if (r != ESP_OK) return r;
+    /* Register RX hooks on the per-PDO COB-IDs */
+    canopen_register_pdo_cb(0x180 + ZLAC_NODE, on_tpdo_statusword,  NULL);
+    canopen_register_pdo_cb(0x280 + ZLAC_NODE, on_tpdo_positions,   NULL);
+    canopen_register_pdo_cb(0x380 + ZLAC_NODE, on_tpdo_velocities,  NULL);
+
+    /* Enter operational */
+    ESP_LOGI(TAG, "NMT start node %u", (unsigned)ZLAC_NODE);
+    canopen_nmt_send(CANOPEN_NMT_START_REMOTE, ZLAC_NODE);
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    /* PDO mapping must be configured in pre-operational */
-    r = configure_rpdo1(node);
-    if (r != ESP_OK) {
-        ESP_LOGE(TAG, "axis %d: RPDO1 mapping failed: %s",
-                 axis, esp_err_to_name(r));
-        return r;
-    }
-    r = configure_tpdo(node, OBJ_TPDO1_COMM, OBJ_TPDO1_MAP,
-                       CANOPEN_COB_TPDO1_BASE,
-                       MAP_ENTRY(OBJ_STATUSWORD,      0, 16),
-                       MAP_ENTRY(OBJ_POSITION_ACTUAL, 0, 32));
-    if (r != ESP_OK) {
-        ESP_LOGE(TAG, "axis %d: TPDO1 mapping failed: %s",
-                 axis, esp_err_to_name(r));
-        return r;
-    }
-    r = configure_tpdo(node, OBJ_TPDO2_COMM, OBJ_TPDO2_MAP,
-                       CANOPEN_COB_TPDO2_BASE,
-                       MAP_ENTRY(OBJ_VELOCITY_ACTUAL, 0, 32),
-                       /* second entry reserved/dummy — drives that
-                        * reject this can be tuned later. */
-                       MAP_ENTRY(OBJ_VELOCITY_ACTUAL, 0, 32));
-    if (r != ESP_OK) {
-        ESP_LOGW(TAG, "axis %d: TPDO2 mapping failed: %s (velocity feedback unavailable)",
-                 axis, esp_err_to_name(r));
-        /* Non-fatal — position-based velocity estimate at the upper
-         * layer would be a fallback; we just lose live RPM. */
-    }
-
-    /* Mode of operation = Profile Velocity */
-    r = canopen_sdo_write_i8(node, OBJ_MODES_OF_OPERATION, 0,
-                              CIA402_MODE_PROFILE_VELOCITY,
-                              ZLAC_SDO_TIMEOUT_MS);
-    if (r != ESP_OK) {
-        ESP_LOGE(TAG, "axis %d: mode-of-operation write failed: %s",
-                 axis, esp_err_to_name(r));
-        return r;
-    }
-
-    /* Profile acceleration / deceleration limits */
-    (void)canopen_sdo_write_u32(node, OBJ_PROFILE_ACCEL, 0,
-                                 CONFIG_ZLAC_PROFILE_ACCEL,
-                                 ZLAC_SDO_TIMEOUT_MS);
-    (void)canopen_sdo_write_u32(node, OBJ_PROFILE_DECEL, 0,
-                                 CONFIG_ZLAC_PROFILE_DECEL,
-                                 ZLAC_SDO_TIMEOUT_MS);
-
-    /* NMT start → operational (PDOs become active) */
-    r = canopen_nmt_send(CANOPEN_NMT_START_REMOTE, node);
-    if (r != ESP_OK) return r;
-
-    /* Wait for the first TPDO so we have a statusword to work with. */
-    uint32_t deadline = now_ms() + ZLAC_BOOT_TIMEOUT_MS;
-    while ((int32_t)(deadline - now_ms()) > 0) {
-        bool seen;
-        taskENTER_CRITICAL(&s_axis_mux);
-        seen = s_axis[axis].tpdo_seen;
-        taskEXIT_CRITICAL(&s_axis_mux);
-        if (seen) break;
-        /* Generate SYNC so sync-triggered TPDOs get sent. */
-        (void)canopen_sync_send();
+    /* CiA 402 enable sequence over SDO (single controlword) */
+    static const uint16_t boot_seq[] = { 0x06, 0x07, 0x0F };
+    for (size_t i = 0; i < sizeof(boot_seq)/sizeof(boot_seq[0]); ++i) {
+        if (!sdo_w16(OD_CONTROLWORD, 0, boot_seq[i])) {
+            ESP_LOGE(TAG, "CW=0x%02X SDO failed", boot_seq[i]);
+            return false;
+        }
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 
-    bool tpdo_seen;
-    taskENTER_CRITICAL(&s_axis_mux);
-    tpdo_seen = s_axis[axis].tpdo_seen;
-    taskEXIT_CRITICAL(&s_axis_mux);
-
-    if (!tpdo_seen) {
-        ESP_LOGE(TAG, "axis %d: no TPDO from node %u after start", axis, node);
-        return ESP_ERR_TIMEOUT;
-    }
-
-    ESP_LOGI(TAG, "axis %d (node %u): brought up", axis, node);
-    return ESP_OK;
+    ESP_LOGI(TAG, "ZLAC bring-up complete");
+    return true;
 }
 
-/* ── HAL implementation ─────────────────────────────────────────── */
+/* ---- periodic TX task: RPDO0 (controlword) + RPDO1 (targets) --------- */
+
+static void tx_task(void *arg)
+{
+    (void)arg;
+    while (1) {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+
+        /* Translate wheel-side cmd_vel into motor RPM per axis. */
+        float wl_rpm = s_cmd.left_rpm;
+        float wr_rpm = s_cmd.right_rpm;
+        if (s_estop || !s_boot_passed) {
+            wl_rpm = 0.0f;
+            wr_rpm = 0.0f;
+        }
+        int32_t tgt_l = wheel_rpm_to_motor_rpm((int32_t)wl_rpm);
+        int32_t tgt_r = wheel_rpm_to_motor_rpm((int32_t)wr_rpm);
+        if (tgt_l >  1000) tgt_l =  1000;
+        if (tgt_l < -1000) tgt_l = -1000;
+        if (tgt_r >  1000) tgt_r =  1000;
+        if (tgt_r < -1000) tgt_r = -1000;
+        s_axes[AXIS_LEFT].target_motor_rpm  = tgt_l;
+        s_axes[AXIS_RIGHT].target_motor_rpm = tgt_r;
+        int32_t bus_l = s_axes[AXIS_LEFT].invert  ? -tgt_l : tgt_l;
+        int32_t bus_r = s_axes[AXIS_RIGHT].invert ? -tgt_r : tgt_r;
+
+        /* Single shared controlword: step worst axis toward target. */
+        cia402_state_t st_l = s_axes[AXIS_LEFT].state;
+        cia402_state_t st_r = s_axes[AXIS_RIGHT].state;
+        cia402_state_t worst = (st_l < st_r) ? st_l : st_r;
+        cia402_state_t target_state =
+            (s_estop || !s_boot_passed)
+                ? CIA402_STATE_SWITCH_ON_DISABLED
+                : CIA402_STATE_OPERATION_ENABLED;
+        uint16_t cw = cia402_next_controlword(worst, target_state,
+                                              s_prev_cw_had_reset);
+        s_prev_cw_had_reset = (cw & 0x0080) != 0;
+
+        xSemaphoreGive(s_lock);
+
+        /* RPDO0: controlword (cob 0x200+node, 2 bytes) */
+        uint8_t cw_frame[2] = {
+            (uint8_t)(cw & 0xFF),
+            (uint8_t)((cw >> 8) & 0xFF),
+        };
+        canopen_send_pdo(0x200 + ZLAC_NODE, cw_frame, 2);
+
+        /* RPDO1: target velocities (cob 0x300+node, 8 bytes) */
+        uint8_t v_frame[8];
+        memcpy(&v_frame[0], &bus_l, 4);
+        memcpy(&v_frame[4], &bus_r, 4);
+        canopen_send_pdo(0x300 + ZLAC_NODE, v_frame, 8);
+
+        /* Pull the freshest heartbeat snapshot for the offline check. */
+        canopen_nmt_state_t nmt = CANOPEN_NMT_STATE_BOOTUP;
+        uint32_t hb_ms = 0;
+        if (canopen_get_heartbeat(ZLAC_NODE, &nmt, &hb_ms)) {
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            s_heartbeat_seen      = true;
+            s_last_heartbeat_ms   = hb_ms;
+            xSemaphoreGive(s_lock);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(ZLAC_TX_TICK_MS));
+    }
+}
+
+/* ---- motor_driver.h HAL implementation -------------------------------- */
 
 esp_err_t motor_driver_init(void)
 {
-    s_events = xEventGroupCreate();
-    if (s_events == NULL) return ESP_ERR_NO_MEM;
+    if (s_initialised) return ESP_OK;
+    s_lock = xSemaphoreCreateMutex();
+    if (!s_lock) return ESP_ERR_NO_MEM;
 
-    /* Health defaults: not yet up. */
-    taskENTER_CRITICAL(&s_health_mux);
-    s_health.online      = false;
-    s_health.boot_passed = false;
-    s_health.fault_bits  = 0;
-    taskEXIT_CRITICAL(&s_health_mux);
+    memset(s_axes, 0, sizeof(s_axes));
+#ifdef CONFIG_ZLAC_INVERT_LEFT
+    s_axes[AXIS_LEFT].invert  = true;
+#endif
+#ifdef CONFIG_ZLAC_INVERT_RIGHT
+    s_axes[AXIS_RIGHT].invert = true;
+#endif
+    s_estop             = false;
+    s_prev_cw_had_reset = false;
+    s_cmd.left_rpm      = 0.0f;
+    s_cmd.right_rpm     = 0.0f;
 
-    esp_err_t r = canopen_init(CONFIG_ZLAC_CAN_TX_GPIO,
-                               CONFIG_ZLAC_CAN_RX_GPIO);
-    if (r != ESP_OK) {
-        ESP_LOGE(TAG, "canopen_init failed: %s", esp_err_to_name(r));
-        return r;
+    esp_err_t err = canopen_init(ZLAC_TX_GPIO, ZLAC_RX_GPIO);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "canopen_init failed: %s", esp_err_to_name(err));
+        return err;
     }
 
-    /* Register TPDO callbacks BEFORE NMT start so we don't miss the
-     * very first sync-triggered frames. */
-    for (int axis = 0; axis < ZLAC_NUM_AXES; axis++) {
-        r = register_axis_callbacks(axis);
-        if (r != ESP_OK) {
-            ESP_LOGE(TAG, "axis %d: cb registration failed: %s",
-                     axis, esp_err_to_name(r));
-            return r;
-        }
+    s_boot_passed = bring_up_drive();
+    if (!s_boot_passed) {
+        ESP_LOGE(TAG, "bring-up failed; backend will stay disarmed");
+        /* still spawn tx task so health telemetry remains queryable */
     }
 
-    bool all_ok = true;
-    for (int axis = 0; axis < ZLAC_NUM_AXES; axis++) {
-        r = bring_up_axis(axis);
-        if (r != ESP_OK) {
-            ESP_LOGE(TAG, "axis %d bring-up failed: %s",
-                     axis, esp_err_to_name(r));
-            all_ok = false;
-        }
+    BaseType_t ok = xTaskCreatePinnedToCore(
+        tx_task, "zlac_tx", 4096, NULL, 6, &s_tx_task, 1);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "tx task spawn failed");
+        return ESP_FAIL;
     }
 
-    taskENTER_CRITICAL(&s_health_mux);
-    s_health.boot_passed = all_ok;
-    s_health.online      = all_ok;
-    taskEXIT_CRITICAL(&s_health_mux);
-
-    /* Spawn TX task regardless of boot result — disarmed it will
-     * keep sending Disable-Voltage controlwords (safe). */
-    BaseType_t ok = xTaskCreatePinnedToCore(zlac_tx_task, "motor_zlac_tx",
-        ZLAC_TX_TASK_STACK, NULL, ZLAC_TX_TASK_PRIO, NULL,
-        ZLAC_TX_TASK_CORE);
-    if (ok != pdPASS) return ESP_FAIL;
-
-    if (all_ok) {
-        xEventGroupSetBits(s_events, BIT_ARMED);
-        ESP_LOGI(TAG, "ZLAC8015D armed (both axes operational)");
-    } else {
-        ESP_LOGE(TAG, "ZLAC8015D health check failed; motor commands disarmed. "
-                      "Fix wiring/config and reboot.");
-    }
-
-    return ESP_OK;
+    s_initialised = true;
+    return s_boot_passed ? ESP_OK : ESP_FAIL;
 }
 
 bool motor_driver_is_armed(void)
 {
-    if (s_events == NULL) return false;
-    return (xEventGroupGetBits(s_events) & BIT_ARMED) != 0;
+    if (!s_initialised) return false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool armed = s_boot_passed &&
+                 !s_estop &&
+                 s_axes[AXIS_LEFT].state  == CIA402_STATE_OPERATION_ENABLED &&
+                 s_axes[AXIS_RIGHT].state == CIA402_STATE_OPERATION_ENABLED;
+    xSemaphoreGive(s_lock);
+    return armed;
 }
 
 void motor_driver_set_cmd(const motor_wheel_cmd_t *cmd)
 {
-    if (cmd == NULL) return;
-    taskENTER_CRITICAL(&s_cmd_mux);
+    if (!cmd || !s_initialised) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
     s_cmd   = *cmd;
-    s_estop = false;     /* sticky-clear: matches VESC backend semantics */
-    taskEXIT_CRITICAL(&s_cmd_mux);
+    s_estop = false;     /* match VESC backend: any set_cmd lifts latch */
+    xSemaphoreGive(s_lock);
 }
 
 void motor_driver_emergency_stop(void)
 {
-    taskENTER_CRITICAL(&s_cmd_mux);
+    if (!s_initialised) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
     s_cmd.left_rpm  = 0.0f;
     s_cmd.right_rpm = 0.0f;
-    s_estop = true;
-    taskEXIT_CRITICAL(&s_cmd_mux);
+    s_estop         = true;
+    xSemaphoreGive(s_lock);
+}
+
+static uint32_t map_fault_bits(uint16_t sw)
+{
+    /* Bit 3 of statusword = drive in fault.  Without 0x603F context
+     * we cannot bucket further; mark as OTHER. */
+    return (sw & 0x0008) ? MOTOR_FAULT_OTHER : 0;
 }
 
 bool motor_driver_get_feedback(motor_feedback_t *fb_out)
 {
-    if (fb_out == NULL) return false;
-    bool valid;
-    taskENTER_CRITICAL(&s_feedback_mux);
-    *fb_out = s_feedback;
-    valid = s_feedback_valid;
-    taskEXIT_CRITICAL(&s_feedback_mux);
-    if (!valid) {
-        memset(fb_out, 0, sizeof(*fb_out));
-        return false;
-    }
-    return true;
+    if (!fb_out) return false;
+    memset(fb_out, 0, sizeof(*fb_out));
+    if (!s_initialised) return false;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    bool any = s_axes[AXIS_LEFT].tpdo_seen || s_axes[AXIS_RIGHT].tpdo_seen;
+    int32_t mrpm_l = s_axes[AXIS_LEFT].actual_motor_rpm;
+    int32_t mrpm_r = s_axes[AXIS_RIGHT].actual_motor_rpm;
+    int32_t cnts_l = s_axes[AXIS_LEFT].position_counts;
+    int32_t cnts_r = s_axes[AXIS_RIGHT].position_counts;
+    uint16_t sw_l  = s_axes[AXIS_LEFT].statusword;
+    uint16_t sw_r  = s_axes[AXIS_RIGHT].statusword;
+    uint32_t t_l   = s_axes[AXIS_LEFT].last_tpdo_ms;
+    uint32_t t_r   = s_axes[AXIS_RIGHT].last_tpdo_ms;
+    xSemaphoreGive(s_lock);
+
+    int32_t cpwr = counts_per_wheel_rev();
+    fb_out->left.rpm           = (float)motor_rpm_to_wheel_rpm(mrpm_l);
+    fb_out->left.revolutions   = (float)((double)cnts_l / (double)cpwr);
+    fb_out->left.current_a     = 0.0f;
+    fb_out->left.fault_code_raw= sw_l;
+    fb_out->left.fault_bits    = map_fault_bits(sw_l);
+    fb_out->right.rpm          = (float)motor_rpm_to_wheel_rpm(mrpm_r);
+    fb_out->right.revolutions  = (float)((double)cnts_r / (double)cpwr);
+    fb_out->right.current_a    = 0.0f;
+    fb_out->right.fault_code_raw= sw_r;
+    fb_out->right.fault_bits   = map_fault_bits(sw_r);
+    fb_out->bus_voltage_v      = 0.0f;  /* 0x2035 not in PDO map */
+    fb_out->last_update_ms     = (t_l > t_r) ? t_l : t_r;
+    return any;
 }
 
 bool motor_driver_get_health(motor_health_t *health_out)
 {
-    if (health_out == NULL) return false;
-    taskENTER_CRITICAL(&s_health_mux);
-    *health_out = s_health;
-    taskEXIT_CRITICAL(&s_health_mux);
+    if (!health_out) return false;
+    memset(health_out, 0, sizeof(*health_out));
+    if (!s_initialised) return true;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    uint32_t t       = now_ms();
+    bool hb_fresh    = s_heartbeat_seen &&
+                       (t - s_last_heartbeat_ms) < ZLAC_HEARTBEAT_TIMEOUT;
+    bool tpdo_fresh  = s_axes[AXIS_LEFT].tpdo_seen && s_axes[AXIS_RIGHT].tpdo_seen &&
+                       (t - s_axes[AXIS_LEFT].last_tpdo_ms)  < ZLAC_TPDO_TIMEOUT &&
+                       (t - s_axes[AXIS_RIGHT].last_tpdo_ms) < ZLAC_TPDO_TIMEOUT;
+    uint32_t faults  = map_fault_bits(s_axes[AXIS_LEFT].statusword) |
+                       map_fault_bits(s_axes[AXIS_RIGHT].statusword);
+    if (!hb_fresh) faults |= MOTOR_FAULT_COMMUNICATION;
+    health_out->online      = s_boot_passed && hb_fresh && tpdo_fresh;
+    health_out->boot_passed = s_boot_passed;
+    health_out->fault_bits  = faults;
+    xSemaphoreGive(s_lock);
     return true;
 }
 
-/* ── Backend-specific diagnostics ───────────────────────────────── */
+/* ---- diagnostics (motor_driver_zlac8015d.h) -------------------------- */
 
 bool motor_driver_zlac_get_axis_status(int axis, zlac_axis_status_t *out)
 {
-    if (out == NULL || axis < 0 || axis >= ZLAC_NUM_AXES) return false;
-    canopen_nmt_state_t hb_state = CANOPEN_NMT_STATE_BOOTUP;
-    uint32_t hb_last = 0;
-    bool hb_seen = canopen_get_heartbeat(s_node_id[axis], &hb_state, &hb_last);
-    uint32_t t = now_ms();
-
-    zlac_axis_state_t snap;
-    taskENTER_CRITICAL(&s_axis_mux);
-    snap = s_axis[axis];
-    taskEXIT_CRITICAL(&s_axis_mux);
-
-    out->heartbeat_seen            = hb_seen;
-    out->last_heartbeat_ms         = hb_last;
-    out->pdo_fresh                 = snap.tpdo_seen &&
-                                     ((t - snap.last_tpdo_ms) <= ZLAC_TPDO_TIMEOUT_MS);
-    out->last_tpdo_ms              = snap.last_tpdo_ms;
-    out->statusword                = snap.statusword;
-    out->state                     = cia402_decode_state(snap.statusword);
-    out->target_velocity_motor_rpm = snap.cmd_velocity_motor_rpm;
-    out->actual_velocity_motor_rpm = snap.velocity_motor_rpm;
-    out->position_counts           = snap.position_counts;
+    if (axis < 0 || axis >= NUM_AXES || !out) return false;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    out->heartbeat_seen    = s_heartbeat_seen;
+    out->last_heartbeat_ms = s_last_heartbeat_ms;
+    out->pdo_fresh         = s_axes[axis].tpdo_seen &&
+                             (now_ms() - s_axes[axis].last_tpdo_ms)
+                                 < ZLAC_TPDO_TIMEOUT;
+    out->last_tpdo_ms      = s_axes[axis].last_tpdo_ms;
+    out->statusword        = s_axes[axis].statusword;
+    out->state             = s_axes[axis].state;
+    out->target_velocity_motor_rpm = s_axes[axis].target_motor_rpm;
+    out->actual_velocity_motor_rpm = s_axes[axis].actual_motor_rpm;
+    out->position_counts   = s_axes[axis].position_counts;
+    xSemaphoreGive(s_lock);
     return true;
 }

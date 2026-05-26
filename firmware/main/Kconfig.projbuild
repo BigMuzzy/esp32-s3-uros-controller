@@ -45,23 +45,26 @@ config ZLAC_CAN_RX_GPIO
     int "TWAI RX GPIO"
     default 16
 
-config ZLAC_NODE_LEFT
-    int "CANopen node ID for the LEFT axis"
+config ZLAC_NODE_ID
+    int "CANopen node ID of the drive"
     range 1 127
     default 1
-
-config ZLAC_NODE_RIGHT
-    int "CANopen node ID for the RIGHT axis"
-    range 1 127
-    default 2
-
-config ZLAC_ENCODER_CPR
-    int "Encoder counts per motor revolution (post-quadrature)"
-    default 16384
     help
-        4096-line incremental encoders deliver 16384 counts/rev
-        after 4× quadrature decoding inside the drive.  Override
-        if your motor uses a different encoder.
+        ZLAC8015D is a single CANopen node with two motor
+        channels (LEFT = sub-index 1, RIGHT = sub-index 2 on the
+        relevant objects). Default factory ID is 1; change via
+        object 0x200A if you have multiple drives on one bus.
+
+config ZLAC_ENCODER_COUNTS_PER_REV
+    int "Encoder counts per motor revolution"
+    default 4096
+    help
+        Counts reported by object 0x6064 per motor shaft
+        revolution.  Equal to (drive PPR setting in 0x200E) × 4
+        after the drive's internal quadrature decoding.  Default
+        factory PPR is 1024 → 4096 counts/rev.  If you reprogram
+        0x200E to 4096 (matching a 4096-line encoder) set this
+        to 16384.
 
 config ZLAC_GEAR_RATIO_X100
     int "Gear ratio × 100 (e.g. 200 = 2.00:1)"
@@ -79,13 +82,37 @@ config ZLAC_INVERT_RIGHT
     bool "Invert RIGHT axis direction"
     default n
 
-config ZLAC_PROFILE_ACCEL
-    int "Profile acceleration (motor RPM/s)"
+config ZLAC_PROFILE_ACCEL_MS
+    int "S-curve acceleration time (ms, object 0x6083)"
+    range 0 32767
+    default 500
+    help
+        Time to accelerate from 0 to target speed.  Vendor unit
+        is milliseconds (NOT RPM/s).
+
+config ZLAC_PROFILE_DECEL_MS
+    int "S-curve deceleration time (ms, object 0x6084)"
+    range 0 32767
     default 500
 
-config ZLAC_PROFILE_DECEL
-    int "Profile deceleration (motor RPM/s)"
-    default 500
+config ZLAC_HEARTBEAT_INTERVAL_MS
+    int "Producer heartbeat interval (ms, object 0x1017)"
+    range 20 2000
+    default 100
+    help
+        Drive sends a heartbeat frame on 0x700+node at this
+        cadence.  Underlying register unit is 0.5 ms; firmware
+        converts.  Set 0 in 0x1017 means disabled, so we always
+        write a non-zero value during bring-up.
+
+config ZLAC_TPDO_EVENT_MS
+    int "TPDO event-timer interval (ms, object 0x18xx:5)"
+    range 5 200
+    default 20
+    help
+        Drive transmits each TPDO at this cadence (timer-trigger,
+        transmission type 0xFF).  Underlying register unit is
+        0.5 ms; firmware converts.
 
 endmenu
 
