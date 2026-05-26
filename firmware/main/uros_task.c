@@ -14,8 +14,11 @@
 
 #include "uros_task.h"
 #include "uros_transport_usb_jtag.h"
+#include "sdkconfig.h"
 #include "motor_task.h"
+#ifdef CONFIG_MOTOR_DRIVER_VESC
 #include "motor_driver_vesc.h"   /* VESC-backend-specific battery health */
+#endif
 #include "rc_failsafe.h"
 #include "diff_drive.h"
 
@@ -66,7 +69,9 @@ static void yaw_to_quaternion(float yaw,
 static geometry_msgs__msg__Twist  s_cmd_vel_msg;
 static nav_msgs__msg__Odometry    s_odom_msg;
 static std_msgs__msg__Bool        s_failsafe_msg;
+#ifdef CONFIG_MOTOR_DRIVER_VESC
 static sensor_msgs__msg__BatteryState s_battery_msg[2]; /* [0]=LEFT, [1]=RIGHT */
+#endif
 
 /* ── cmd_vel subscription callback ───────────────────────────────── */
 
@@ -135,8 +140,10 @@ static void publish_failsafe(rcl_publisher_t *pub)
 }
 
 /* Per-VESC health → sensor_msgs/BatteryState.
- * We populate the fields that have meaningful VESC mappings and leave
- * the rest at NaN (the documented convention for "not measured"). */
+ * VESC-specific path: queries motor_driver_vesc directly for the per-
+ * controller voltage.  Backend-agnostic battery publishing (using
+ * motor_feedback_t.bus_voltage_v) is a later-phase item. */
+#ifdef CONFIG_MOTOR_DRIVER_VESC
 static void publish_battery(rcl_publisher_t *pub, uint8_t vesc_id, int idx)
 {
     vesc_health_t h;
@@ -158,6 +165,7 @@ static void publish_battery(rcl_publisher_t *pub, uint8_t vesc_id, int idx)
 
     rcl_publish(pub, m, NULL);
 }
+#endif /* CONFIG_MOTOR_DRIVER_VESC */
 
 /* ── Main task ───────────────────────────────────────────────────── */
 
@@ -208,6 +216,7 @@ static void uros_task_fn(void *arg)
             ESP_LOGE(TAG, "failsafe publisher init failed: %d", (int)rc);
         }
 
+#ifdef CONFIG_MOTOR_DRIVER_VESC
         rcl_publisher_t battery_pub[2];
         rc = rclc_publisher_init_default(&battery_pub[0], &node,
             ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, BatteryState),
@@ -221,6 +230,7 @@ static void uros_task_fn(void *arg)
         if (rc != RCL_RET_OK) {
             ESP_LOGE(TAG, "vesc/right/battery publisher init failed: %d", (int)rc);
         }
+#endif
 
         /* ── Subscription ───────────────────────────────────────── */
         rcl_subscription_t cmd_vel_sub;
@@ -253,8 +263,10 @@ static void uros_task_fn(void *arg)
                                      RCL_MS_TO_NS(UROS_SPIN_PERIOD_MS));
             publish_odom(&odom_pub);
             publish_failsafe(&failsafe_pub);
+#ifdef CONFIG_MOTOR_DRIVER_VESC
             publish_battery(&battery_pub[0], VESC_ID_LEFT,  0);
             publish_battery(&battery_pub[1], VESC_ID_RIGHT, 1);
+#endif
         }
 
         /* ── Agent lost — cleanup ───────────────────────────────── */
@@ -262,8 +274,10 @@ static void uros_task_fn(void *arg)
 
         rclc_executor_fini(&executor);
         rcl_subscription_fini(&cmd_vel_sub, &node);
+#ifdef CONFIG_MOTOR_DRIVER_VESC
         rcl_publisher_fini(&battery_pub[1], &node);
         rcl_publisher_fini(&battery_pub[0], &node);
+#endif
         rcl_publisher_fini(&failsafe_pub, &node);
         rcl_publisher_fini(&odom_pub, &node);
         rcl_node_fini(&node);

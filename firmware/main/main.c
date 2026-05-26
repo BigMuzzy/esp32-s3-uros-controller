@@ -14,11 +14,14 @@
  */
 
 #include "esp_log.h"
+#include "sdkconfig.h"
 #include "rc_failsafe.h"
 #include "motor_driver.h"
 #include "motor_task.h"
 #include "uros_task.h"
+#ifdef CONFIG_MOTOR_DRIVER_VESC
 #include "tune_cli.h"
+#endif
 
 static const char *TAG = "main";
 
@@ -63,9 +66,11 @@ void app_main(void)
     }
     ESP_LOGI(TAG, "micro-ROS task started on Core 0");
 
-    /* 5. Tuning CLI — UART0 today (transport-abstracted, WiFi planned).
-     * Independent of micro-ROS; safe to leave running. Non-fatal if it
-     * fails to start — the rest of the controller keeps working. */
+    /* 5. Tuning CLI — VESC-specific (operates in ERPM, talks to the
+     * VESC speed PID).  Only built when the VESC backend is selected.
+     * Non-fatal if it fails to start — the rest of the controller
+     * keeps working. */
+#ifdef CONFIG_MOTOR_DRIVER_VESC
     ret = tune_cli_init();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "tune_cli_init failed: %s (continuing)",
@@ -73,6 +78,7 @@ void app_main(void)
     } else {
         ESP_LOGI(TAG, "tune_cli started");
     }
+#endif
 
     /* app_main returns — FreeRTOS tasks run independently */
     ESP_LOGI(TAG, "All tasks running");

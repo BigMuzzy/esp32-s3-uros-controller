@@ -1,4 +1,39 @@
+menu "Motor Driver"
+
+choice MOTOR_DRIVER_BACKEND
+    prompt "Motor controller backend"
+    default MOTOR_DRIVER_VESC
+    help
+        Selects the motor-controller hardware the firmware drives.
+        Exactly one backend is compiled in; the others are excluded
+        from the build by CMake.  The HAL contract is defined in
+        main/motor_driver.h — all upper-layer code (motor_task,
+        diff_drive, uros_task) is backend-agnostic.
+
+config MOTOR_DRIVER_VESC
+    bool "VESC (2× controllers over custom CAN)"
+    help
+        Two VESC ESC/BLDC controllers on a shared TWAI bus at
+        500 kbit/s.  Custom CAN protocol (SET_RPM / STATUS /
+        STATUS_5 / PING / PONG).  Wheel velocity controlled via
+        the on-board speed PID; tuning over the tune_cli CLI.
+
+config MOTOR_DRIVER_ZLAC8015D
+    bool "ZLAC8015D (1× dual-channel over CANopen) — not yet implemented"
+    help
+        Single ZLAC8015D dual-channel servo drive on the TWAI bus
+        speaking CANopen CiA 402 (Profile Velocity mode).  Driving
+        2× ZLLG65ASM250 servo motors with 4096-line absolute
+        encoders.  Backend is a placeholder today — selecting it
+        will fail to build until the motor_driver_zlac8015d.c
+        backend is added.
+
+endchoice
+
+endmenu
+
 menu "Tuning CLI (VESC PID)"
+    depends on MOTOR_DRIVER_VESC
 
 config TUNE_WIFI_ENABLE
     bool "Enable WiFi TCP transport"
