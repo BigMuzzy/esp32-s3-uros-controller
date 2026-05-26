@@ -19,16 +19,73 @@ config MOTOR_DRIVER_VESC
         the on-board speed PID; tuning over the tune_cli CLI.
 
 config MOTOR_DRIVER_ZLAC8015D
-    bool "ZLAC8015D (1× dual-channel over CANopen) — not yet implemented"
+    bool "ZLAC8015D (1× dual-channel over CANopen)"
     help
         Single ZLAC8015D dual-channel servo drive on the TWAI bus
         speaking CANopen CiA 402 (Profile Velocity mode).  Driving
         2× ZLLG65ASM250 servo motors with 4096-line absolute
-        encoders.  Backend is a placeholder today — selecting it
-        will fail to build until the motor_driver_zlac8015d.c
-        backend is added.
+        encoders.
+
+        Default object-dictionary assumptions are documented in
+        main/motor_driver_zlac8015d.c — review against the vendor
+        manual before robot bring-up.
 
 endchoice
+
+endmenu
+
+menu "ZLAC8015D backend"
+    depends on MOTOR_DRIVER_ZLAC8015D
+
+config ZLAC_CAN_TX_GPIO
+    int "TWAI TX GPIO"
+    default 15
+
+config ZLAC_CAN_RX_GPIO
+    int "TWAI RX GPIO"
+    default 16
+
+config ZLAC_NODE_LEFT
+    int "CANopen node ID for the LEFT axis"
+    range 1 127
+    default 1
+
+config ZLAC_NODE_RIGHT
+    int "CANopen node ID for the RIGHT axis"
+    range 1 127
+    default 2
+
+config ZLAC_ENCODER_CPR
+    int "Encoder counts per motor revolution (post-quadrature)"
+    default 16384
+    help
+        4096-line incremental encoders deliver 16384 counts/rev
+        after 4× quadrature decoding inside the drive.  Override
+        if your motor uses a different encoder.
+
+config ZLAC_GEAR_RATIO_X100
+    int "Gear ratio × 100 (e.g. 200 = 2.00:1)"
+    default 100
+    help
+        Mechanical reduction between motor shaft and wheel.  Used
+        for both velocity (wheel_rpm = motor_rpm / ratio) and
+        position (wheel_revs = counts / (cpr × ratio)).
+
+config ZLAC_INVERT_LEFT
+    bool "Invert LEFT axis direction"
+    default n
+
+config ZLAC_INVERT_RIGHT
+    bool "Invert RIGHT axis direction"
+    default n
+
+config ZLAC_PROFILE_ACCEL
+    int "Profile acceleration (motor RPM/s)"
+    default 500
+
+config ZLAC_PROFILE_DECEL
+    int "Profile deceleration (motor RPM/s)"
+    default 500
 
 endmenu
 

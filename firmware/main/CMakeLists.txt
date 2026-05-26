@@ -9,8 +9,7 @@ set(MAIN_SRCS
 )
 
 # Backend-specific sources, gated by the Kconfig MOTOR_DRIVER_BACKEND choice.
-# Exactly one of these blocks contributes.  Selecting the ZLAC8015D backend
-# fails to build until motor_driver_zlac8015d.c is added (Phase 2).
+# Exactly one of these blocks contributes.
 if(CONFIG_MOTOR_DRIVER_VESC)
     list(APPEND MAIN_SRCS
         "vesc_can.c"
@@ -20,6 +19,14 @@ if(CONFIG_MOTOR_DRIVER_VESC)
         "tune_cli.c"
         "tune_transport_uart.c"
         "tune_transport_wifi.c"
+    )
+endif()
+
+if(CONFIG_MOTOR_DRIVER_ZLAC8015D)
+    list(APPEND MAIN_SRCS
+        "canopen.c"
+        "cia402.c"
+        "motor_driver_zlac8015d.c"
     )
 endif()
 
