@@ -4,9 +4,16 @@
  * Lifecycle:
  *   1. Configure USB-CDC transport
  *   2. Wait for micro-ROS agent
- *   3. Create node, publishers, subscriptions
- *   4. Spin loop: executor spin + publish odom/status/failsafe
+ *   3. Create node, publishers, subscriptions; sync session clock
+ *   4. Spin loop: executor spin + publish odom/status/failsafe,
+ *      periodic clock re-sync
  *   5. On agent disconnect: destroy entities, go to step 2
+ *
+ * Time: the ESP32 has no RTC.  micro-ROS runs an NTP-style handshake
+ * with the agent (rmw_uros_sync_session) and derives the offset from
+ * esp_timer's monotonic clock to the ROS epoch.  Odometry is stamped
+ * with rmw_uros_epoch_nanos(); publishing is gated until the first
+ * sync so consumers never see a zero-stamped frame.
  *
  * Depends on micro_ros_espidf_component — will not compile until
  * that component is added to the project.
@@ -36,6 +43,7 @@
 #include <nav_msgs/msg/odometry.h>
 #include <sensor_msgs/msg/battery_state.h>
 #include <std_msgs/msg/bool.h>
+#include <builtin_interfaces/msg/time.h>
 
 #include <rmw_microxrcedds_c/config.h>
 #include <rmw_microros/rmw_microros.h>
@@ -111,13 +119,35 @@ static void cmd_vel_cb(const void *msg_in)
 
 /* ── Publish helpers ─────────────────────────────────────────────── */
 
+/* Fill a ROS Time from the agent-synced epoch.  Cheap at 100 Hz —
+ * rmw_uros_epoch_nanos() is just esp_timer + the stored offset. */
+static void stamp_now(builtin_interfaces__msg__Time *stamp)
+{
+    if (rmw_uros_epoch_synchronized()) {
+        int64_t ns = rmw_uros_epoch_nanos();
+        stamp->sec     = (int32_t)(ns / 1000000000LL);
+        stamp->nanosec = (uint32_t)(ns % 1000000000LL);
+    } else {
+        stamp->sec     = 0;
+        stamp->nanosec = 0;
+    }
+}
+
 static void publish_odom(rcl_publisher_t *pub)
 {
+    /* Gate: don't emit a zero-stamped frame before the first agent
+     * time sync.  tf2 / the host EKF reject sec=0 messages, and the
+     * robot is not meaningfully moving in those first few hundred ms. */
+    if (!rmw_uros_epoch_synchronized()) {
+        return;
+    }
+
     odom_state_t odom;
     motor_task_get_odom(&odom);
 
-    /* Header */
-    /* frame_id and child_frame_id are set once at init */
+    /* Header — frame_id / child_frame_id and covariance are set once
+     * at init; stamp every publish from the synced clock. */
+    stamp_now(&s_odom_msg.header.stamp);
 
     /* Pose */
     s_odom_msg.pose.pose.position.x = odom.x;
@@ -201,6 +231,17 @@ static void uros_task_fn(void *arg)
             continue;
         }
 
+        /* ── Time sync ──────────────────────────────────────────── */
+        /* NTP-style handshake with the agent.  No RTC needed — computes
+         * the offset from esp_timer's monotonic clock to the ROS epoch.
+         * Non-fatal: the spin loop re-syncs periodically, and odom
+         * publishing is gated until the first sync succeeds. */
+        if (rmw_uros_sync_session(1000) != RMW_RET_OK) {
+            ESP_LOGW(TAG, "initial time sync failed; will retry in spin loop");
+        } else {
+            ESP_LOGI(TAG, "session clock synced to agent");
+        }
+
         /* ── Publishers ─────────────────────────────────────────── */
         rcl_publisher_t odom_pub;
         rc = rclc_publisher_init_default(&odom_pub, &node,
@@ -255,12 +296,46 @@ static void uros_task_fn(void *arg)
         s_odom_msg.child_frame_id.size     = sizeof(base_frame) - 1;
         s_odom_msg.child_frame_id.capacity = sizeof(base_frame);
 
+        /* ── Static odom covariance diagonals ───────────────────── */
+        /* 6x6 row-major [x, y, z, roll, pitch, yaw].  The host EKF
+         * weights inputs by covariance; all-zero reads as "infinitely
+         * certain" and breaks fusion once the M2 IMU lands.  The drive
+         * fuses vx + vyaw, so those diagonals matter most; unused 2D
+         * axes (z/roll/pitch) get a large value.  Starting points —
+         * tune on the bench against the M1 square-drive closure. */
+        s_odom_msg.pose.covariance[0]  = 0.002; /* x     (m^2)    */
+        s_odom_msg.pose.covariance[7]  = 0.002; /* y     (m^2)    */
+        s_odom_msg.pose.covariance[14] = 1e6;   /* z     (unused) */
+        s_odom_msg.pose.covariance[21] = 1e6;   /* roll  (unused) */
+        s_odom_msg.pose.covariance[28] = 1e6;   /* pitch (unused) */
+        s_odom_msg.pose.covariance[35] = 0.01;  /* yaw   (rad^2)  */
+
+        s_odom_msg.twist.covariance[0]  = 0.001; /* vx    (m/s)^2    */
+        s_odom_msg.twist.covariance[7]  = 1e6;   /* vy    (non-holo)*/
+        s_odom_msg.twist.covariance[14] = 1e6;   /* vz              */
+        s_odom_msg.twist.covariance[21] = 1e6;   /* vroll           */
+        s_odom_msg.twist.covariance[28] = 1e6;   /* vpitch          */
+        s_odom_msg.twist.covariance[35] = 0.003; /* vyaw  (rad/s)^2 */
+
         /* ── Spin loop ──────────────────────────────────────────── */
         ESP_LOGI(TAG, "Spinning...");
+
+        /* Seed so the first periodic re-sync fires ~5 s in, not
+         * immediately (we just synced above). */
+        int64_t last_sync_us = esp_timer_get_time();
 
         while (rmw_uros_ping_agent(100, 1) == RMW_RET_OK) {
             rclc_executor_spin_some(&executor,
                                      RCL_MS_TO_NS(UROS_SPIN_PERIOD_MS));
+
+            /* Periodic re-sync for MCU/host crystal drift (~tens of ppm).
+             * Non-fatal on timeout — the stored offset stays valid. */
+            int64_t now_us = esp_timer_get_time();
+            if (now_us - last_sync_us > 5000000LL) {   /* every 5 s */
+                rmw_uros_sync_session(200);
+                last_sync_us = now_us;
+            }
+
             publish_odom(&odom_pub);
             publish_failsafe(&failsafe_pub);
 #ifdef CONFIG_MOTOR_DRIVER_VESC
