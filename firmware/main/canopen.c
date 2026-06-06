@@ -158,7 +158,8 @@ static void handle_sdo_response(const twai_message_t *msg)
      * them before kicking off the TX, and no other path writes here. */
     if (!s_sdo.active) {
         ESP_LOGW(TAG, "Stray SDO response: node=%u idx=0x%04X.%02u",
-                 msg->identifier - CANOPEN_COB_SDO_TX_BASE, index, sub);
+                 (unsigned)(msg->identifier - CANOPEN_COB_SDO_TX_BASE),
+                 index, sub);
         return;
     }
     uint8_t responder = (uint8_t)(msg->identifier - CANOPEN_COB_SDO_TX_BASE);

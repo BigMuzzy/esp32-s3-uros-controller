@@ -2,7 +2,7 @@ menu "Motor Driver"
 
 choice MOTOR_DRIVER_BACKEND
     prompt "Motor controller backend"
-    default MOTOR_DRIVER_VESC
+    default MOTOR_DRIVER_ZLAC8015D
     help
         Selects the motor-controller hardware the firmware drives.
         Exactly one backend is compiled in; the others are excluded
@@ -56,15 +56,21 @@ config ZLAC_NODE_ID
         object 0x200A if you have multiple drives on one bus.
 
 config ZLAC_ENCODER_COUNTS_PER_REV
-    int "Encoder counts per motor revolution"
-    default 4096
+    int "Encoder counts per motor revolution (fallback)"
+    default 16384
     help
         Counts reported by object 0x6064 per motor shaft
-        revolution.  Equal to (drive PPR setting in 0x200E) × 4
-        after the drive's internal quadrature decoding.  Default
-        factory PPR is 1024 → 4096 counts/rev.  If you reprogram
-        0x200E to 4096 (matching a 4096-line encoder) set this
-        to 16384.
+        revolution.  Equal to (drive encoder-wire setting in
+        0x200E:n) × 4 after the drive's internal quadrature
+        decoding.
+
+        The ZLLG65ASM250 V3.0 hub motor has a 4096-line encoder,
+        so a correctly commissioned drive reports 4096 × 4 =
+        16384 counts/rev.  At runtime the backend READS 0x200E:01
+        from the drive and uses (value × 4); this Kconfig value is
+        only the fallback used if that SDO read fails.  The drive's
+        generic factory default for 0x200E is 1024 (→ 4096), which
+        does NOT match this motor — keep the runtime read enabled.
 
 config ZLAC_GEAR_RATIO_X100
     int "Gear ratio × 100 (e.g. 200 = 2.00:1)"
@@ -73,6 +79,21 @@ config ZLAC_GEAR_RATIO_X100
         Mechanical reduction between motor shaft and wheel.  Used
         for both velocity (wheel_rpm = motor_rpm / ratio) and
         position (wheel_revs = counts / (cpr × ratio)).
+
+        The ZLLG65ASM250 is a DIRECT-DRIVE hub motor — the motor
+        rotor is the wheel — so the ratio is 1:1 (value 100).
+
+config ZLAC_MAX_MOTOR_RPM
+    int "Maximum commanded motor speed (r/min)"
+    range 1 1000
+    default 500
+    help
+        Per-axis magnitude clamp applied to the profile-velocity
+        target (object 0x60FF) before transmission.  The drive
+        raises a "speed setting error" fault if commanded above the
+        motor's rated speed, so this defaults to the ZLLG65ASM250
+        rated speed of 500 r/min (peak is 560).  Protocol maximum
+        is 1000.
 
 config ZLAC_INVERT_LEFT
     bool "Invert LEFT axis direction"

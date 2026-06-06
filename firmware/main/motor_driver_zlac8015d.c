@@ -10,11 +10,12 @@
  *     0x60FF, …).  Controlword (0x6040) and mode-of-operation (0x6060)
  *     are single u16/u8 values that govern BOTH channels at once.
  *
- *   * Statusword 0x6041 is a U32: low 16 bits = LEFT axis, high 16 bits
- *     = RIGHT axis.  Each half follows the standard CiA 402 state-word
- *     bit layout (0x21 = RTSO, 0x23 = SO, 0x27 = OE, 0x40 = SOD, bit3
- *     = fault).  See routine document §3.1 "Status word switching
- *     state" — fully matches cia402.h decoder.
+ *   * Statusword 0x6041 is a U32: HIGH 16 bits = LEFT axis, LOW 16 bits
+ *     = RIGHT axis (per Communication Routine V1.07 object 0x6041:
+ *     "High 16 bit: left motor; Low 16 bit: right motor").  Each half
+ *     follows the standard CiA 402 state-word bit layout (0x21 = RTSO,
+ *     0x23 = SO, 0x27 = OE, 0x40 = SOD, bit3 = fault).  Matches the
+ *     cia402.h decoder.
  *
  *   * Profile Velocity mode (0x6060 = 3) accepts targets at 0x60FF.
  *     With speed-resolution 0x2026:05 = 1 (factory default) the raw
@@ -27,9 +28,13 @@
  *     gear ratio.  Target commands stay in raw RPM.
  *
  *   * Position feedback 0x6064 is encoder counts (sub 1 / 2, each i32).
- *     CONFIG_ZLAC_ENCODER_COUNTS_PER_REV is the counts/rev at the
- *     motor shaft and equals 4 × (drive PPR 0x200E setting).  Default
- *     factory PPR = 1024 → 4096 counts/rev.
+ *     Counts/rev = (drive encoder-wire setting 0x200E) × 4 (quadrature).
+ *     The ZLLG65ASM250 V3.0 has a 4096-line encoder → 16384 counts/rev
+ *     on a correctly commissioned drive.  The backend reads 0x200E:01
+ *     during bring-up and derives counts/rev at runtime so odometry is
+ *     correct regardless of the drive's stored encoder setting; it
+ *     falls back to CONFIG_ZLAC_ENCODER_COUNTS_PER_REV if the read
+ *     fails.
  *
  *   * Accel/decel objects 0x6083/0x6084 are S-curve TIMES in
  *     milliseconds (per QSG §9 object dictionary), NOT RPM/s.
@@ -76,6 +81,7 @@
 #define OD_RPDO_MAP_BASE        0x1600  /* +n */
 #define OD_TPDO_COMM_BASE       0x1800  /* +n */
 #define OD_TPDO_MAP_BASE        0x1A00  /* +n */
+#define OD_ENCODER_WIRE         0x200E  /* u16, sub1=L sub2=R (lines)      */
 #define OD_FAULT_CODE           0x603F  /* u32 (low16=L, high16=R)         */
 #define OD_CONTROLWORD          0x6040  /* u16, shared                     */
 #define OD_STATUSWORD           0x6041  /* u32 (low16=L, high16=R)         */
@@ -106,6 +112,7 @@
 #define ZLAC_NODE               CONFIG_ZLAC_NODE_ID
 #define ZLAC_COUNTS_PER_REV     CONFIG_ZLAC_ENCODER_COUNTS_PER_REV
 #define ZLAC_GEAR_X100          CONFIG_ZLAC_GEAR_RATIO_X100
+#define ZLAC_MAX_MOTOR_RPM      CONFIG_ZLAC_MAX_MOTOR_RPM
 #define ZLAC_ACCEL_MS           CONFIG_ZLAC_PROFILE_ACCEL_MS
 #define ZLAC_DECEL_MS           CONFIG_ZLAC_PROFILE_DECEL_MS
 #define ZLAC_HEARTBEAT_MS       CONFIG_ZLAC_HEARTBEAT_INTERVAL_MS
@@ -134,6 +141,11 @@ static SemaphoreHandle_t s_lock;
 static TaskHandle_t      s_tx_task;
 static bool              s_initialised;
 static bool              s_boot_passed;
+
+/* Encoder counts per MOTOR revolution.  Seeded from Kconfig, then
+ * overwritten at bring-up with (0x200E:01 × 4) read back from the drive
+ * so odometry tracks the drive's actual encoder-wire setting. */
+static int32_t           s_counts_per_motor_rev = ZLAC_COUNTS_PER_REV;
 
 /* Wheel-side command set by motor_driver_set_cmd() */
 static motor_wheel_cmd_t s_cmd;
@@ -165,7 +177,7 @@ static inline int32_t wheel_rpm_to_motor_rpm(int32_t wrpm)
 
 static inline int32_t counts_per_wheel_rev(void)
 {
-    return (int32_t)((int64_t)ZLAC_COUNTS_PER_REV * ZLAC_GEAR_X100 / 100);
+    return (int32_t)((int64_t)s_counts_per_motor_rev * ZLAC_GEAR_X100 / 100);
 }
 
 /* ---- TPDO receive callbacks ------------------------------------------- */
@@ -177,8 +189,9 @@ static void on_tpdo_statusword(uint32_t cob_id, const uint8_t *data,
     if (dlc < 4) return;
     uint32_t sw32 = (uint32_t)data[0] | ((uint32_t)data[1] << 8)
                   | ((uint32_t)data[2] << 16) | ((uint32_t)data[3] << 24);
-    uint16_t sw_l = (uint16_t)(sw32 & 0xFFFF);
-    uint16_t sw_r = (uint16_t)((sw32 >> 16) & 0xFFFF);
+    /* Object 0x6041 (U32): HIGH 16 = LEFT motor, LOW 16 = RIGHT motor. */
+    uint16_t sw_r = (uint16_t)(sw32 & 0xFFFF);
+    uint16_t sw_l = (uint16_t)((sw32 >> 16) & 0xFFFF);
     uint32_t t = now_ms();
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -318,6 +331,25 @@ static bool bring_up_drive(void)
         return false;
     }
 
+    /* Read the drive's encoder-wire setting (0x200E:01, lines) and derive
+     * counts/rev = lines × 4 (quadrature).  This makes odometry track the
+     * drive's actual configuration instead of a compile-time guess; the
+     * ZLLG65ASM250 has a 4096-line encoder → 16384 counts/rev.  Keep the
+     * Kconfig fallback if the read fails. */
+    {
+        uint16_t enc_lines = 0;
+        if (canopen_sdo_read_u16(ZLAC_NODE, OD_ENCODER_WIRE, 1,
+                                 &enc_lines, 0) == ESP_OK &&
+            enc_lines > 0) {
+            s_counts_per_motor_rev = (int32_t)enc_lines * 4;
+            ESP_LOGI(TAG, "encoder 0x200E:01 = %u lines -> %d counts/rev",
+                     (unsigned)enc_lines, (int)s_counts_per_motor_rev);
+        } else {
+            ESP_LOGW(TAG, "0x200E read failed; using fallback %d counts/rev",
+                     (int)s_counts_per_motor_rev);
+        }
+    }
+
     /* Accel / decel times (ms) — set both channels */
     if (!sdo_w32(OD_ACCEL_TIME, 1, ZLAC_ACCEL_MS) ||
         !sdo_w32(OD_ACCEL_TIME, 2, ZLAC_ACCEL_MS) ||
@@ -421,10 +453,13 @@ static void tx_task(void *arg)
         }
         int32_t tgt_l = wheel_rpm_to_motor_rpm((int32_t)wl_rpm);
         int32_t tgt_r = wheel_rpm_to_motor_rpm((int32_t)wr_rpm);
-        if (tgt_l >  1000) tgt_l =  1000;
-        if (tgt_l < -1000) tgt_l = -1000;
-        if (tgt_r >  1000) tgt_r =  1000;
-        if (tgt_r < -1000) tgt_r = -1000;
+        /* Clamp to the motor's rated speed (ZLAC_MAX_MOTOR_RPM); the drive
+         * faults if commanded above its rated speed. */
+        const int32_t vmax = ZLAC_MAX_MOTOR_RPM;
+        if (tgt_l >  vmax) tgt_l =  vmax;
+        if (tgt_l < -vmax) tgt_l = -vmax;
+        if (tgt_r >  vmax) tgt_r =  vmax;
+        if (tgt_r < -vmax) tgt_r = -vmax;
         s_axes[AXIS_LEFT].target_motor_rpm  = tgt_l;
         s_axes[AXIS_RIGHT].target_motor_rpm = tgt_r;
         int32_t bus_l = s_axes[AXIS_LEFT].invert  ? -tgt_l : tgt_l;
