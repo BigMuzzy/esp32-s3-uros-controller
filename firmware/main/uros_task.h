@@ -5,10 +5,10 @@
  * ROS 2 pub/sub. Runs a spin loop at ~10 ms that:
  *
  *   1. Spins the micro-ROS executor (triggers subscription callbacks)
- *   2. Reads odom from motor_task_get_odom() → publishes nav_msgs/Odometry
- *   3. Reads per-VESC health from motor_driver_vesc_get_health() →
- *      publishes /vesc/*/battery telemetry
- *   4. Reads drive mode from rc_failsafe_get_mode() → publishes failsafe/active
+ *   2. Reads odom from motor_task_get_odom() -> publishes nav_msgs/Odometry
+ *   3. Reads per-motor health from the motor driver HAL ->
+ *      publishes battery/telemetry topics (VESC backend only)
+ *   4. Reads drive mode from rc_failsafe_get_mode() -> publishes failsafe/active
  *
  * Subscription callback:
  *   cmd_vel → motor_task_set_cmd_vel()  (writes to Core 1)
