@@ -82,6 +82,7 @@
 #define OD_RPDO_MAP_BASE        0x1600  /* +n */
 #define OD_TPDO_COMM_BASE       0x1800  /* +n */
 #define OD_TPDO_MAP_BASE        0x1A00  /* +n */
+#define OD_CONTROL_MODE         0x200F  /* u16, 0=async (sub1/2), 1=sync   */
 #define OD_ENCODER_WIRE         0x200E  /* u16, sub1=L sub2=R (lines)      */
 #define OD_FAULT_CODE           0x603F  /* u32 (low16=L, high16=R)         */
 #define OD_CONTROLWORD          0x6040  /* u16, shared                     */
@@ -373,6 +374,17 @@ static bool bring_up_sequence(void)
     if (!sdo_w16(OD_HEARTBEAT_TIME, 0,
                  (uint16_t)(ZLAC_HEARTBEAT_MS * 2))) {
         ESP_LOGE(TAG, "set 0x1017 failed");
+        return false;
+    }
+
+    /* Asynchronous control: target velocities are taken from 0x60FF:01
+     * (left) and 0x60FF:02 (right) independently.  The ZLAC8015D PV-mode
+     * routine (§3.4.2) sets 0x200F=0 as its first step; if the drive is
+     * left in synchronous mode (0x200F=1) it instead reads the combined
+     * target from 0x60FF:03 and ignores sub1/sub2 entirely — leaving the
+     * motors stationary even though our per-channel writes succeed. */
+    if (!sdo_w16(OD_CONTROL_MODE, 0, 0)) {
+        ESP_LOGE(TAG, "set 0x200F (async) failed");
         return false;
     }
 
