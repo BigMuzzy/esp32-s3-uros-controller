@@ -154,6 +154,44 @@ bool canopen_get_heartbeat(uint8_t node_id,
                            canopen_nmt_state_t *state_out,
                            uint32_t *last_ms_out);
 
+/* ── Bus diagnostics & recovery ──────────────────────────────────── */
+
+/**
+ * Log a snapshot of the TWAI controller health: current state
+ * (RUNNING / ERR_PASSIVE / BUS_OFF / …), TX/RX error counters, and any
+ * alerts latched since the last read (TX_FAILED, BUS_ERROR, BUS_OFF, …).
+ *
+ * Also prints an interpretation hint:
+ *   - high TX errors / bus-off  → our frames are not being ACKed
+ *     (drive unpowered, CAN_H/L wiring, missing 120 Ω termination, or a
+ *      bus bitrate other than 500 kbit/s).
+ *   - healthy bus but no reply  → likely wrong node ID, or the drive is
+ *     not yet in a state to answer.
+ *
+ * `context` is a short tag included in the log lines (may be NULL).
+ * Safe to call from any task; non-blocking.
+ */
+void canopen_log_bus_diagnostics(const char *context);
+
+/**
+ * If the controller is in the bus-off state, initiate TWAI recovery and
+ * restart the driver so subsequent transmissions can succeed once the
+ * bus fault clears.  No-op when the bus is already running.  Blocks up
+ * to ~1 s waiting for recovery to complete.
+ */
+esp_err_t canopen_bus_recover(void);
+
+/**
+ * Probe SDO read of object 0x1000:00 (device type, mandatory in CiA 301)
+ * across node IDs 1..127 and log which IDs respond.  Useful when the
+ * configured node ID does not match the drive — the scan reveals the
+ * drive's actual node ID so CONFIG_ZLAC_NODE_ID can be corrected.
+ *
+ * Blocking: worst case ~5 s (127 × 40 ms).  Intended for one-shot
+ * bring-up diagnostics, not the steady-state control loop.
+ */
+void canopen_scan_nodes(void);
+
 #ifdef __cplusplus
 }
 #endif

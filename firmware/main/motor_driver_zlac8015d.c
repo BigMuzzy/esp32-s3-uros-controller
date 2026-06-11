@@ -76,6 +76,7 @@
 
 /* ---- object dictionary indexes ---------------------------------------- */
 
+#define OD_DEVICE_TYPE          0x1000  /* u32, CiA 301 mandatory          */
 #define OD_HEARTBEAT_TIME       0x1017  /* u16, unit 0.5 ms                */
 #define OD_RPDO_COMM_BASE       0x1400  /* +n */
 #define OD_RPDO_MAP_BASE        0x1600  /* +n */
@@ -312,11 +313,61 @@ static bool configure_tpdo(uint8_t pdo_idx,
     return true;
 }
 
-static bool bring_up_drive(void)
+/* Time to wait for the drive to answer SDOs after an NMT reset.  The
+ * ZLAC8015D reboots its CANopen stack on reset_node and is briefly
+ * unresponsive; manual §3.2 documents a 0x700+ID boot-up frame as the
+ * ready signal.  3 s comfortably covers the observed reboot time. */
+#define ZLAC_READY_TIMEOUT_MS   3000U
+
+/* Poll until the drive is ready to accept SDOs after a reset issued at
+ * reset_ms.  Logs the boot-up heartbeat (manual §3.2) when seen, and
+ * confirms responsiveness with an SDO read of 0x1000 (device type). */
+static bool wait_for_drive_ready(uint32_t reset_ms, uint32_t timeout_ms)
+{
+    bool bootup_logged = false;
+    int  probes        = 0;
+
+    while (now_ms() - reset_ms < timeout_ms) {
+        canopen_nmt_state_t st;
+        uint32_t hb_ms = 0;
+        if (!bootup_logged &&
+            canopen_get_heartbeat(ZLAC_NODE, &st, &hb_ms) &&
+            (int32_t)(hb_ms - reset_ms) >= 0) {
+            ESP_LOGI(TAG, "drive boot-up frame seen (NMT state=%d)", (int)st);
+            bootup_logged = true;
+        }
+
+        uint32_t devtype = 0;
+        ++probes;
+        if (canopen_sdo_read_u32(ZLAC_NODE, OD_DEVICE_TYPE, 0,
+                                 &devtype, 50) == ESP_OK) {
+            ESP_LOGI(TAG, "drive ready after %d probe(s): "
+                          "0x1000 device type = 0x%08" PRIx32, probes, devtype);
+            return true;
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    ESP_LOGW(TAG, "drive did not answer within %" PRIu32 " ms (%d probes)",
+             timeout_ms, probes);
+    return false;
+}
+
+static bool bring_up_sequence(void)
 {
     ESP_LOGI(TAG, "ZLAC bring-up: NMT reset node %u", (unsigned)ZLAC_NODE);
+    uint32_t reset_ms = now_ms();
     canopen_nmt_send(CANOPEN_NMT_RESET_NODE, ZLAC_NODE);
-    vTaskDelay(pdMS_TO_TICKS(500));   /* wait for boot-up */
+
+    /* Per ZLAC8015D manual §3.2 the drive emits a 0x700+ID boot-up frame
+     * once it is ready after power-on / NMT reset, and only then will it
+     * answer SDOs.  A fixed delay races the drive's reboot, so instead
+     * wait for the boot-up heartbeat and confirm responsiveness with an
+     * SDO read (0x1000 device type) before issuing any config writes. */
+    if (!wait_for_drive_ready(reset_ms, ZLAC_READY_TIMEOUT_MS)) {
+        ESP_LOGE(TAG, "drive not responsive after reset");
+        return false;
+    }
 
     /* Heartbeat producer */
     if (!sdo_w16(OD_HEARTBEAT_TIME, 0,
@@ -434,6 +485,44 @@ static bool bring_up_drive(void)
 
     ESP_LOGI(TAG, "ZLAC bring-up complete");
     return true;
+}
+
+/* Retry the full bring-up: the drive may power up or finish its own boot
+ * after the ESP32, so a single attempt can race ahead of it.  On each
+ * failed attempt, dump TWAI diagnostics (to pinpoint wiring / bitrate /
+ * node-ID faults) and recover the bus if a no-ACK storm drove it bus-off. */
+#define ZLAC_BRINGUP_MAX_ATTEMPTS 5
+#define ZLAC_BRINGUP_RETRY_MS     1000
+
+static bool bring_up_drive(void)
+{
+    for (int attempt = 1; attempt <= ZLAC_BRINGUP_MAX_ATTEMPTS; ++attempt) {
+        ESP_LOGI(TAG, "ZLAC bring-up attempt %d/%d",
+                 attempt, ZLAC_BRINGUP_MAX_ATTEMPTS);
+
+        if (bring_up_sequence()) {
+            return true;
+        }
+
+        ESP_LOGW(TAG, "bring-up attempt %d failed (node %u)",
+                 attempt, (unsigned)ZLAC_NODE);
+        canopen_log_bus_diagnostics("bring-up");
+        canopen_bus_recover();
+
+        if (attempt < ZLAC_BRINGUP_MAX_ATTEMPTS) {
+            vTaskDelay(pdMS_TO_TICKS(ZLAC_BRINGUP_RETRY_MS));
+        }
+    }
+
+    ESP_LOGE(TAG, "bring-up failed after %d attempts",
+             ZLAC_BRINGUP_MAX_ATTEMPTS);
+    /* One-shot node scan to reveal the drive's actual node ID — the most
+     * common cause of "frames ACKed but no SDO reply" is a node-ID mismatch
+     * (configured %u). */
+    ESP_LOGW(TAG, "configured node ID is %u; scanning bus for the drive...",
+             (unsigned)ZLAC_NODE);
+    canopen_scan_nodes();
+    return false;
 }
 
 /* ---- periodic TX task: RPDO0 (controlword) + RPDO1 (targets) --------- */

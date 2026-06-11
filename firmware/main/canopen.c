@@ -267,6 +267,154 @@ esp_err_t canopen_init(int gpio_tx, int gpio_rx)
     return ESP_OK;
 }
 
+/* ── Bus diagnostics & recovery ─────────────────────────────────── */
+
+static const char *twai_state_str(twai_state_t st)
+{
+    switch (st) {
+    case TWAI_STATE_STOPPED:    return "STOPPED";
+    case TWAI_STATE_RUNNING:    return "RUNNING";
+    case TWAI_STATE_BUS_OFF:    return "BUS_OFF";
+    case TWAI_STATE_RECOVERING: return "RECOVERING";
+    default:                    return "?";
+    }
+}
+
+void canopen_log_bus_diagnostics(const char *context)
+{
+    const char *ctx = context ? context : "";
+
+    if (!s_inited) {
+        ESP_LOGW(TAG, "diag(%s): TWAI not initialised", ctx);
+        return;
+    }
+
+    /* Non-blocking: returns whatever alerts have latched since last read. */
+    uint32_t alerts = 0;
+    if (twai_read_alerts(&alerts, 0) != ESP_OK) {
+        alerts = 0;   /* ESP_ERR_TIMEOUT == none pending */
+    }
+
+    twai_status_info_t st;
+    if (twai_get_status_info(&st) != ESP_OK) {
+        ESP_LOGW(TAG, "diag(%s): status query failed", ctx);
+        return;
+    }
+
+    ESP_LOGW(TAG, "diag(%s): state=%s tx_err=%" PRIu32 " rx_err=%" PRIu32
+                  " tx_failed=%" PRIu32 " bus_err=%" PRIu32 " arb_lost=%" PRIu32
+                  " tx_q=%" PRIu32 " rx_q=%" PRIu32,
+             ctx, twai_state_str(st.state),
+             st.tx_error_counter, st.rx_error_counter,
+             st.tx_failed_count, st.bus_error_count, st.arb_lost_count,
+             st.msgs_to_tx, st.msgs_to_rx);
+
+    if (alerts) {
+        ESP_LOGW(TAG, "diag(%s): alerts=0x%08" PRIx32 "%s%s%s%s%s", ctx, alerts,
+                 (alerts & TWAI_ALERT_TX_FAILED)     ? " TX_FAILED"   : "",
+                 (alerts & TWAI_ALERT_BUS_ERROR)     ? " BUS_ERROR"   : "",
+                 (alerts & TWAI_ALERT_ERR_PASS)      ? " ERR_PASSIVE" : "",
+                 (alerts & TWAI_ALERT_BUS_OFF)       ? " BUS_OFF"     : "",
+                 (alerts & TWAI_ALERT_RX_QUEUE_FULL) ? " RX_Q_FULL"   : "");
+    }
+
+    bool not_acked = (st.state == TWAI_STATE_BUS_OFF) ||
+                     (st.tx_error_counter >= 96) ||
+                     (st.tx_failed_count > 0) ||
+                     (alerts & (TWAI_ALERT_TX_FAILED | TWAI_ALERT_BUS_OFF));
+
+    bool rx_corrupt = (st.rx_error_counter >= 8) ||
+                      (st.bus_error_count > 0) ||
+                      (alerts & TWAI_ALERT_BUS_ERROR);
+
+    if (not_acked) {
+        ESP_LOGE(TAG, "diag(%s): TX not ACKed — no node is acknowledging our "
+                      "frames. Check: drive powered? CAN_H/L wiring + 120 ohm "
+                      "termination at both ends? bus bitrate = 500 kbit/s?", ctx);
+    } else if (rx_corrupt) {
+        ESP_LOGW(TAG, "diag(%s): our frames ARE ACKed (tx_err=%" PRIu32 ") but we "
+                      "received corrupted/foreign frames — possible second device "
+                      "at a different bitrate, electrical noise, or marginal "
+                      "termination. A peer is present at 500 kbit/s.",
+                 ctx, st.tx_error_counter);
+    } else if (st.tx_error_counter == 0 && st.rx_error_counter == 0) {
+        ESP_LOGW(TAG, "diag(%s): bus healthy and our frames are ACKed, but no SDO "
+                      "reply — a node is present at 500 kbit/s but did not answer. "
+                      "Likely the drive is still booting (see manual §3.2 boot-up "
+                      "frame) or the node ID is wrong (run a node scan).", ctx);
+    }
+}
+
+void canopen_scan_nodes(void)
+{
+    if (!s_inited) {
+        ESP_LOGW(TAG, "scan: TWAI not initialised");
+        return;
+    }
+
+    ESP_LOGW(TAG, "scanning CANopen node IDs 1..127 (SDO read 0x1000:00)...");
+    int found = 0;
+    for (uint8_t node = 1; node <= 127; ++node) {
+        uint32_t devtype = 0;
+        esp_err_t r = canopen_sdo_read_u32(node, 0x1000, 0, &devtype, 40);
+        if (r == ESP_OK) {
+            ESP_LOGW(TAG, "  -> node %u present: 0x1000 device type = 0x%08" PRIx32,
+                     (unsigned)node, devtype);
+            found++;
+        } else if (r == ESP_ERR_INVALID_RESPONSE) {
+            /* SDO abort: the node answered but lacks 0x1000 — still present. */
+            ESP_LOGW(TAG, "  -> node %u present (SDO abort on 0x1000)",
+                     (unsigned)node);
+            found++;
+        }
+    }
+
+    if (found == 0) {
+        ESP_LOGE(TAG, "scan: no node answered an SDO. If frames are being ACKed "
+                      "(tx_err=0) the device may use a non-standard SDO COB-ID; "
+                      "otherwise check power / wiring / termination / bitrate.");
+    } else {
+        ESP_LOGW(TAG, "scan: %d node(s) answered. Set CONFIG_ZLAC_NODE_ID to the "
+                      "drive's ID above, then rebuild.", found);
+    }
+}
+
+esp_err_t canopen_bus_recover(void)
+{
+    if (!s_inited) return ESP_ERR_INVALID_STATE;
+
+    twai_status_info_t st;
+    if (twai_get_status_info(&st) != ESP_OK) return ESP_FAIL;
+
+    if (st.state == TWAI_STATE_BUS_OFF) {
+        ESP_LOGW(TAG, "bus-off detected — initiating TWAI recovery");
+        esp_err_t r = twai_initiate_recovery();
+        if (r != ESP_OK) {
+            ESP_LOGE(TAG, "twai_initiate_recovery: %s", esp_err_to_name(r));
+            return r;
+        }
+        /* Recovery finishes after 128×11 recessive bits; poll for the
+         * transition out of RECOVERING (driver lands in STOPPED). */
+        for (int i = 0; i < 20; ++i) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            if (twai_get_status_info(&st) == ESP_OK &&
+                st.state != TWAI_STATE_RECOVERING) {
+                break;
+            }
+        }
+    }
+
+    if (twai_get_status_info(&st) == ESP_OK && st.state == TWAI_STATE_STOPPED) {
+        esp_err_t r = twai_start();
+        if (r != ESP_OK) {
+            ESP_LOGE(TAG, "twai_start after recovery: %s", esp_err_to_name(r));
+            return r;
+        }
+        ESP_LOGI(TAG, "TWAI restarted after bus recovery");
+    }
+    return ESP_OK;
+}
+
 esp_err_t canopen_nmt_send(canopen_nmt_cmd_t cmd, uint8_t node_id)
 {
     uint8_t payload[2] = { (uint8_t)cmd, node_id };
