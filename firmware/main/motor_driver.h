@@ -145,7 +145,8 @@ typedef struct {
 /**
  * Initialise the motor-driver backend.  Brings up the underlying
  * transport (TWAI, RS485, …), performs the boot health check
- * (probe both wheels, verify bus voltage), and starts whatever
+ * (probe both wheels; the VESC backend also verifies bus voltage —
+ * the ZLAC backend does not currently expose it), and starts whatever
  * background tasks the backend needs.
  *
  * Must be called exactly once, before any other motor_driver_* call.
@@ -188,10 +189,27 @@ void motor_driver_set_cmd(const motor_wheel_cmd_t *cmd);
  * plus, on backends that support it, an active braking current.
  * Used by the failsafe path and the boot sequence.
  *
+ * The stop is *latched*: once engaged the backend holds zero output
+ * regardless of subsequent `motor_driver_set_cmd` calls, until
+ * `motor_driver_clear_emergency_stop` is called.  This keeps the stop
+ * sticky across the control loop's steady stream of setpoints (which
+ * would otherwise lift it on the very next tick).
+ *
  * Safe to call before `motor_driver_init` (no-op) and from interrupt
  * context (best-effort — backend may defer the actual TX to its task).
  */
 void motor_driver_emergency_stop(void);
+
+/**
+ * Release a latched emergency stop engaged by
+ * `motor_driver_emergency_stop`.  Ordinary `motor_driver_set_cmd`
+ * calls do NOT lift the latch — clearing is always explicit so a
+ * fault-handling caller stays in control of when motion may resume.
+ *
+ * No-op if no stop is latched or before `motor_driver_init`.  Safe to
+ * call from any task / any core.
+ */
+void motor_driver_clear_emergency_stop(void);
 
 /* ── Feedback ────────────────────────────────────────────────────── */
 

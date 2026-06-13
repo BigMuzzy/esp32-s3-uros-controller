@@ -72,7 +72,10 @@ static bool select_wheel_cmd(uint32_t now_ms,
 
     if (!armed) return false;
 
-    /* Latch the tune override snapshot once for use below. */
+    /* Latch the tune override snapshot once for use below.  Note the
+     * override is only ever populated by tune_cli, which is VESC-only
+     * (see main.c), so in the default ZLAC build tune_fresh is always
+     * false and the tune branches below are inert. */
     float tune_l = 0.0f, tune_r = 0.0f;
     uint32_t tune_refresh = 0;
     taskENTER_CRITICAL(&s_tune_mux);
@@ -142,6 +145,17 @@ static void motor_task_fn(void *arg)
         /* Update odometry from HAL feedback. */
         motor_feedback_t fb;
         if (motor_driver_get_feedback(&fb)) {
+            /* Gate velocity on feedback freshness.  get_feedback() returns
+             * the last snapshot forever once any has been seen, so without
+             * this a comms dropout would freeze a stale (possibly non-zero)
+             * velocity into odom at the loop rate.  Stale → report zero
+             * velocity; the frozen revolution counts integrate to ~0 pose
+             * delta regardless, so the pose simply holds. */
+            bool fb_fresh =
+                (now_ms - fb.last_update_ms) <= MOTOR_FEEDBACK_TIMEOUT_MS;
+            float rpm_l = fb_fresh ? fb.left.rpm  : 0.0f;
+            float rpm_r = fb_fresh ? fb.right.rpm : 0.0f;
+
             odom_state_t odom_local;
             taskENTER_CRITICAL(&s_odom_mux);
             odom_local = s_odom;
@@ -149,7 +163,7 @@ static void motor_task_fn(void *arg)
 
             diff_drive_update_odom(&odom_local,
                                    fb.left.revolutions, fb.right.revolutions,
-                                   fb.left.rpm,         fb.right.rpm);
+                                   rpm_l,               rpm_r);
 
             taskENTER_CRITICAL(&s_odom_mux);
             s_odom = odom_local;

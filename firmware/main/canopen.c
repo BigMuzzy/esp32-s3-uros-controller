@@ -15,8 +15,10 @@
  *   - SDO requests serialise through s_sdo_mutex.  A single binary
  *     semaphore signals "response received"; the response COB-ID, idx,
  *     sub are validated before the data is copied into the caller's
- *     buffer.  Aborts (SCS=0x80) are surfaced as ESP_ERR_INVALID_RESPONSE
- *     and the abort code is logged at ERROR level.
+ *     buffer, and a per-request generation counter rejects a late reply
+ *     from a previously timed-out transfer.  Aborts (SCS=0x80) are
+ *     surfaced as ESP_ERR_INVALID_RESPONSE and the abort code is logged
+ *     at ERROR level.
  */
 
 #include "canopen.h"
@@ -36,13 +38,20 @@ static const char *TAG = "canopen";
 /* ── Tunables ───────────────────────────────────────────────────── */
 
 #define CANOPEN_RX_TASK_STACK     4096
-#define CANOPEN_RX_TASK_PRIO      6        /* highest, never miss frames */
+#define CANOPEN_RX_TASK_PRIO      7        /* above the backend's zlac_tx (6)
+                                            * so the RX demux preempts it and
+                                            * never misses an incoming frame */
 #define CANOPEN_RX_TASK_CORE      1
 
 #define CANOPEN_TWAI_TX_TIMEOUT_MS  5
 #define CANOPEN_SDO_DEFAULT_TO_MS   200
 #define CANOPEN_MAX_PDO_CB          16
-#define CANOPEN_MAX_NODES           8        /* heartbeats indexed 1..7 */
+#define CANOPEN_MAX_NODES           127      /* full CiA 301 node-id range 1..127.
+                                              * Table is (N+1)*12 B ≈ 1.5 KB; sized
+                                              * to the whole range so heartbeat
+                                              * tracking works for any ZLAC_NODE_ID
+                                              * (Kconfig allows 1..127), not just
+                                              * low IDs. */
 
 /* SDO command specifier (CCS/SCS) — CiA 301 §7.2.4 */
 #define SDO_CCS_DOWNLOAD_INIT     0x20  /* client → server, expedited */
@@ -82,10 +91,12 @@ static canopen_hb_t  s_heartbeat[CANOPEN_MAX_NODES + 1];   /* idx by node id */
 
 typedef struct {
     bool             active;
+    uint32_t         seq;           /* generation, ++ on each new request */
     uint8_t          node;
     uint16_t         index;
     uint8_t          sub;
     /* Filled by RX task before giving the semaphore */
+    uint32_t         rx_seq;        /* s_sdo.seq this response was matched to */
     uint8_t          rx_scs;        /* command specifier byte */
     uint16_t         rx_index;
     uint8_t          rx_sub;
@@ -176,6 +187,7 @@ static void handle_sdo_response(const twai_message_t *msg)
     s_sdo.rx_sub   = sub;
     s_sdo.rx_data  = data;
     s_sdo.rx_abort_code = (scs == SDO_ABORT) ? data : 0;
+    s_sdo.rx_seq   = s_sdo.seq;   /* stamp with the in-flight generation */
     xSemaphoreGive(s_sdo_done_sem);
 }
 
@@ -464,6 +476,8 @@ static esp_err_t sdo_expedited_write(uint8_t node, uint16_t idx, uint8_t sub,
     (void)xSemaphoreTake(s_sdo_done_sem, 0);
 
     s_sdo.active = true;
+    s_sdo.seq++;                       /* new generation for this request */
+    uint32_t my_seq = s_sdo.seq;
     s_sdo.node   = node;
     s_sdo.index  = idx;
     s_sdo.sub    = sub;
@@ -486,11 +500,20 @@ static esp_err_t sdo_expedited_write(uint8_t node, uint16_t idx, uint8_t sub,
         return ESP_ERR_TIMEOUT;
     }
 
-    uint8_t  scs   = s_sdo.rx_scs;
-    uint32_t abort = s_sdo.rx_abort_code;
+    uint8_t  scs    = s_sdo.rx_scs;
+    uint32_t abort  = s_sdo.rx_abort_code;
+    bool     seq_ok = (s_sdo.rx_seq == my_seq);
     s_sdo.active = false;
     xSemaphoreGive(s_sdo_mutex);
 
+    if (!seq_ok) {
+        /* Response belonged to an earlier (timed-out) generation that
+         * slipped past the drain — reject so a late reply can't satisfy
+         * this request with stale data. */
+        ESP_LOGW(TAG, "SDO write stale response node=%u idx=0x%04X.%02u",
+                 node, idx, sub);
+        return ESP_ERR_TIMEOUT;
+    }
     if (scs == SDO_ABORT) {
         ESP_LOGE(TAG, "SDO write abort node=%u idx=0x%04X.%02u code=0x%08" PRIX32,
                  node, idx, sub, abort);
@@ -553,6 +576,8 @@ static esp_err_t sdo_expedited_read(uint8_t node, uint16_t idx, uint8_t sub,
     (void)xSemaphoreTake(s_sdo_done_sem, 0);
 
     s_sdo.active = true;
+    s_sdo.seq++;                       /* new generation for this request */
+    uint32_t my_seq = s_sdo.seq;
     s_sdo.node   = node;
     s_sdo.index  = idx;
     s_sdo.sub    = sub;
@@ -573,12 +598,20 @@ static esp_err_t sdo_expedited_read(uint8_t node, uint16_t idx, uint8_t sub,
         return ESP_ERR_TIMEOUT;
     }
 
-    uint8_t  scs   = s_sdo.rx_scs;
-    uint32_t data  = s_sdo.rx_data;
-    uint32_t abort = s_sdo.rx_abort_code;
+    uint8_t  scs    = s_sdo.rx_scs;
+    uint32_t data   = s_sdo.rx_data;
+    uint32_t abort  = s_sdo.rx_abort_code;
+    bool     seq_ok = (s_sdo.rx_seq == my_seq);
     s_sdo.active = false;
     xSemaphoreGive(s_sdo_mutex);
 
+    if (!seq_ok) {
+        /* Late reply from a prior (timed-out) generation — reject so a
+         * read can't return stale data from the wrong request. */
+        ESP_LOGW(TAG, "SDO read stale response node=%u idx=0x%04X.%02u",
+                 node, idx, sub);
+        return ESP_ERR_TIMEOUT;
+    }
     if (scs == SDO_ABORT) {
         ESP_LOGE(TAG, "SDO read abort node=%u idx=0x%04X.%02u code=0x%08" PRIX32,
                  node, idx, sub, abort);

@@ -62,6 +62,7 @@
 #include "cia402.h"
 
 #include <inttypes.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -84,9 +85,9 @@
 #define OD_TPDO_MAP_BASE        0x1A00  /* +n */
 #define OD_CONTROL_MODE         0x200F  /* u16, 0=async (sub1/2), 1=sync   */
 #define OD_ENCODER_WIRE         0x200E  /* u16, sub1=L sub2=R (lines)      */
-#define OD_FAULT_CODE           0x603F  /* u32 (low16=L, high16=R)         */
+#define OD_FAULT_CODE           0x603F  /* u32 (high16=L, low16=R)         */
 #define OD_CONTROLWORD          0x6040  /* u16, shared                     */
-#define OD_STATUSWORD           0x6041  /* u32 (low16=L, high16=R)         */
+#define OD_STATUSWORD           0x6041  /* u32 (high16=L, low16=R)         */
 #define OD_MODES_OF_OPERATION   0x6060  /* i8,  shared                     */
 #define OD_POSITION_ACTUAL      0x6064  /* i32, sub1=L sub2=R              */
 #define OD_VELOCITY_ACTUAL      0x606C  /* i32, sub1=L sub2=R (0.1 RPM)    */
@@ -130,8 +131,8 @@
 
 typedef struct {
     bool             invert;
-    int32_t          target_motor_rpm;   /* setpoint after sign/clamp */
-    int32_t          actual_motor_rpm;   /* feedback                  */
+    int32_t          target_motor_rpm;   /* setpoint after sign/clamp (motor RPM) */
+    float            actual_motor_rpm;   /* feedback (motor RPM, 0.1 resolution)  */
     int32_t          position_counts;
     uint16_t         statusword;
     cia402_state_t   state;
@@ -151,7 +152,7 @@ static int32_t           s_counts_per_motor_rev = ZLAC_COUNTS_PER_REV;
 
 /* Wheel-side command set by motor_driver_set_cmd() */
 static motor_wheel_cmd_t s_cmd;
-static bool              s_estop;     /* sticky until next set_cmd */
+static bool              s_estop;     /* sticky until motor_driver_clear_emergency_stop() */
 static bool              s_prev_cw_had_reset;
 
 static axis_state_t      s_axes[NUM_AXES];
@@ -167,14 +168,16 @@ static inline uint32_t now_ms(void)
     return (uint32_t)(esp_timer_get_time() / 1000);
 }
 
-static inline int32_t motor_rpm_to_wheel_rpm(int32_t mrpm)
+static inline float motor_rpm_to_wheel_rpm(float mrpm)
 {
-    return (int32_t)((int64_t)mrpm * 100 / ZLAC_GEAR_X100);
+    return mrpm * 100.0f / (float)ZLAC_GEAR_X100;
 }
 
-static inline int32_t wheel_rpm_to_motor_rpm(int32_t wrpm)
+static inline int32_t wheel_rpm_to_motor_rpm(float wrpm)
 {
-    return (int32_t)((int64_t)wrpm * ZLAC_GEAR_X100 / 100);
+    /* lroundf so sub-1-RPM wheel commands aren't truncated away before
+     * the gear scale-up (the wire takes integer motor RPM). */
+    return (int32_t)lroundf(wrpm * (float)ZLAC_GEAR_X100 / 100.0f);
 }
 
 static inline int32_t counts_per_wheel_rev(void)
@@ -234,9 +237,10 @@ static void on_tpdo_velocities(uint32_t cob_id, const uint8_t *data,
     int32_t vel_l_decirpm, vel_r_decirpm;
     memcpy(&vel_l_decirpm, &data[0], 4);
     memcpy(&vel_r_decirpm, &data[4], 4);
-    /* Object 0x606C unit is 0.1 r/min — convert to integer RPM. */
-    int32_t vel_l = vel_l_decirpm / 10;
-    int32_t vel_r = vel_r_decirpm / 10;
+    /* Object 0x606C unit is 0.1 r/min — keep the 0.1-RPM resolution in
+     * float instead of truncating to integer motor RPM. */
+    float vel_l = (float)vel_l_decirpm / 10.0f;
+    float vel_r = (float)vel_r_decirpm / 10.0f;
     uint32_t t = now_ms();
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
@@ -552,8 +556,8 @@ static void tx_task(void *arg)
             wl_rpm = 0.0f;
             wr_rpm = 0.0f;
         }
-        int32_t tgt_l = wheel_rpm_to_motor_rpm((int32_t)wl_rpm);
-        int32_t tgt_r = wheel_rpm_to_motor_rpm((int32_t)wr_rpm);
+        int32_t tgt_l = wheel_rpm_to_motor_rpm(wl_rpm);
+        int32_t tgt_r = wheel_rpm_to_motor_rpm(wr_rpm);
         /* Clamp to the motor's rated speed (ZLAC_MAX_MOTOR_RPM); the drive
          * faults if commanded above its rated speed. */
         const int32_t vmax = ZLAC_MAX_MOTOR_RPM;
@@ -640,14 +644,24 @@ esp_err_t motor_driver_init(void)
     }
 
     BaseType_t ok = xTaskCreatePinnedToCore(
-        tx_task, "zlac_tx", 4096, NULL, 6, &s_tx_task, 1);
+        tx_task, "zlac_tx", 4096, NULL, 6, &s_tx_task, 1);  /* prio 6:
+        intentionally below canopen_rx (7) so the RX demux preempts us */
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "tx task spawn failed");
         return ESP_FAIL;
     }
 
     s_initialised = true;
-    return s_boot_passed ? ESP_OK : ESP_FAIL;
+    /* A failed boot health check is NOT a fatal init error: per the HAL
+     * contract the backend stays queryable (boot_passed=false, set_cmd a
+     * no-op) so app_main keeps the control + micro-ROS tasks running and
+     * diagnostics keep publishing.  The drive may simply power up slower
+     * than our bring-up retries; reporting ESP_FAIL here would make
+     * app_main return and brick an otherwise-recoverable robot.  Only
+     * genuine resource/transport failures above return an error.  This
+     * matches the VESC backend, which also returns ESP_OK on a failed
+     * boot health check. */
+    return ESP_OK;
 }
 
 bool motor_driver_is_armed(void)
@@ -666,8 +680,11 @@ void motor_driver_set_cmd(const motor_wheel_cmd_t *cmd)
 {
     if (!cmd || !s_initialised) return;
     xSemaphoreTake(s_lock, portMAX_DELAY);
-    s_cmd   = *cmd;
-    s_estop = false;     /* match VESC backend: any set_cmd lifts latch */
+    s_cmd = *cmd;
+    /* A latched e-stop is intentionally NOT lifted here.  motor_task
+     * calls set_cmd every 20 ms tick, so auto-clearing would undo the
+     * stop (and its CiA 402 disable sequence) within one period.
+     * Release is explicit via motor_driver_clear_emergency_stop(). */
     xSemaphoreGive(s_lock);
 }
 
@@ -678,6 +695,14 @@ void motor_driver_emergency_stop(void)
     s_cmd.left_rpm  = 0.0f;
     s_cmd.right_rpm = 0.0f;
     s_estop         = true;
+    xSemaphoreGive(s_lock);
+}
+
+void motor_driver_clear_emergency_stop(void)
+{
+    if (!s_initialised) return;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_estop = false;
     xSemaphoreGive(s_lock);
 }
 
@@ -696,8 +721,8 @@ bool motor_driver_get_feedback(motor_feedback_t *fb_out)
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
     bool any = s_axes[AXIS_LEFT].tpdo_seen || s_axes[AXIS_RIGHT].tpdo_seen;
-    int32_t mrpm_l = s_axes[AXIS_LEFT].actual_motor_rpm;
-    int32_t mrpm_r = s_axes[AXIS_RIGHT].actual_motor_rpm;
+    float   mrpm_l = s_axes[AXIS_LEFT].actual_motor_rpm;
+    float   mrpm_r = s_axes[AXIS_RIGHT].actual_motor_rpm;
     int32_t cnts_l = s_axes[AXIS_LEFT].position_counts;
     int32_t cnts_r = s_axes[AXIS_RIGHT].position_counts;
     uint16_t sw_l  = s_axes[AXIS_LEFT].statusword;
@@ -707,12 +732,12 @@ bool motor_driver_get_feedback(motor_feedback_t *fb_out)
     xSemaphoreGive(s_lock);
 
     int32_t cpwr = counts_per_wheel_rev();
-    fb_out->left.rpm           = (float)motor_rpm_to_wheel_rpm(mrpm_l);
+    fb_out->left.rpm           = motor_rpm_to_wheel_rpm(mrpm_l);
     fb_out->left.revolutions   = (float)((double)cnts_l / (double)cpwr);
     fb_out->left.current_a     = 0.0f;
     fb_out->left.fault_code_raw= sw_l;
     fb_out->left.fault_bits    = map_fault_bits(sw_l);
-    fb_out->right.rpm          = (float)motor_rpm_to_wheel_rpm(mrpm_r);
+    fb_out->right.rpm          = motor_rpm_to_wheel_rpm(mrpm_r);
     fb_out->right.revolutions  = (float)((double)cnts_r / (double)cpwr);
     fb_out->right.current_a    = 0.0f;
     fb_out->right.fault_code_raw= sw_r;
@@ -760,7 +785,7 @@ bool motor_driver_zlac_get_axis_status(int axis, zlac_axis_status_t *out)
     out->statusword        = s_axes[axis].statusword;
     out->state             = s_axes[axis].state;
     out->target_velocity_motor_rpm = s_axes[axis].target_motor_rpm;
-    out->actual_velocity_motor_rpm = s_axes[axis].actual_motor_rpm;
+    out->actual_velocity_motor_rpm = (int32_t)lroundf(s_axes[axis].actual_motor_rpm);
     out->position_counts   = s_axes[axis].position_counts;
     xSemaphoreGive(s_lock);
     return true;

@@ -243,47 +243,72 @@ static void uros_task_fn(void *arg)
         }
 
         /* ── Publishers ─────────────────────────────────────────── */
+        /* Each entity is created independently.  A failed init is logged
+         * and that entity is then skipped — never published to, never
+         * fini'd — instead of being used uninitialised.  The subscription
+         * + executor are session-critical: if either fails we skip the
+         * spin loop and reconnect. */
         rcl_publisher_t odom_pub;
         rc = rclc_publisher_init_default(&odom_pub, &node,
             ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry), "odom");
-        if (rc != RCL_RET_OK) {
+        bool odom_ok = (rc == RCL_RET_OK);
+        if (!odom_ok) {
             ESP_LOGE(TAG, "odom publisher init failed: %d", (int)rc);
         }
 
         rcl_publisher_t failsafe_pub;
         rc = rclc_publisher_init_default(&failsafe_pub, &node,
             ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool), "failsafe/active");
-        if (rc != RCL_RET_OK) {
+        bool failsafe_ok = (rc == RCL_RET_OK);
+        if (!failsafe_ok) {
             ESP_LOGE(TAG, "failsafe publisher init failed: %d", (int)rc);
         }
 
 #ifdef CONFIG_MOTOR_DRIVER_VESC
         rcl_publisher_t battery_pub[2];
+        bool battery_ok[2];
         rc = rclc_publisher_init_default(&battery_pub[0], &node,
             ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, BatteryState),
             "vesc/left/battery");
-        if (rc != RCL_RET_OK) {
+        battery_ok[0] = (rc == RCL_RET_OK);
+        if (!battery_ok[0]) {
             ESP_LOGE(TAG, "vesc/left/battery publisher init failed: %d", (int)rc);
         }
         rc = rclc_publisher_init_default(&battery_pub[1], &node,
             ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, BatteryState),
             "vesc/right/battery");
-        if (rc != RCL_RET_OK) {
+        battery_ok[1] = (rc == RCL_RET_OK);
+        if (!battery_ok[1]) {
             ESP_LOGE(TAG, "vesc/right/battery publisher init failed: %d", (int)rc);
         }
 #endif
 
         /* ── Subscription ───────────────────────────────────────── */
         rcl_subscription_t cmd_vel_sub;
-        rclc_subscription_init_default(&cmd_vel_sub, &node,
+        rc = rclc_subscription_init_default(&cmd_vel_sub, &node,
             ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "cmd_vel");
+        bool sub_ok = (rc == RCL_RET_OK);
+        if (!sub_ok) {
+            ESP_LOGE(TAG, "cmd_vel subscription init failed: %d", (int)rc);
+        }
 
         /* ── Executor ───────────────────────────────────────────── */
         rclc_executor_t executor;
-        rclc_executor_init(&executor, &support.context, 1, &allocator);
-        rclc_executor_add_subscription(&executor, &cmd_vel_sub,
-                                        &s_cmd_vel_msg, &cmd_vel_cb,
-                                        ON_NEW_DATA);
+        rc = rclc_executor_init(&executor, &support.context, 1, &allocator);
+        bool exec_init_ok = (rc == RCL_RET_OK);
+        if (!exec_init_ok) {
+            ESP_LOGE(TAG, "executor init failed: %d", (int)rc);
+        }
+        bool exec_ready = false;
+        if (exec_init_ok && sub_ok) {
+            rc = rclc_executor_add_subscription(&executor, &cmd_vel_sub,
+                                                &s_cmd_vel_msg, &cmd_vel_cb,
+                                                ON_NEW_DATA);
+            exec_ready = (rc == RCL_RET_OK);
+            if (!exec_ready) {
+                ESP_LOGE(TAG, "executor add cmd_vel failed: %d", (int)rc);
+            }
+        }
 
         /* ── Init odom message frame IDs ────────────────────────── */
         /* micro-ROS static strings — set once */
@@ -318,43 +343,66 @@ static void uros_task_fn(void *arg)
         s_odom_msg.twist.covariance[35] = 0.003; /* vyaw  (rad/s)^2 */
 
         /* ── Spin loop ──────────────────────────────────────────── */
-        ESP_LOGI(TAG, "Spinning...");
-
-        /* Seed so the first periodic re-sync fires ~5 s in, not
-         * immediately (we just synced above). */
+        /* Seed timers so the first periodic ping / re-sync fire one
+         * interval from now (we just synced + the agent is live). */
         int64_t last_sync_us = esp_timer_get_time();
+        int64_t last_ping_us = last_sync_us;
 
-        while (rmw_uros_ping_agent(100, 1) == RMW_RET_OK) {
+        if (exec_ready) {
+            ESP_LOGI(TAG, "Spinning...");
+        } else {
+            ESP_LOGE(TAG, "executor/subscription unavailable — reconnecting");
+        }
+
+        /* Skipped entirely when exec_ready is false (falls straight
+         * through to cleanup + reconnect). */
+        while (exec_ready) {
             rclc_executor_spin_some(&executor,
                                      RCL_MS_TO_NS(UROS_SPIN_PERIOD_MS));
 
+            int64_t now_us = esp_timer_get_time();
+
+            /* Liveness: ping the agent ~once per second instead of every
+             * spin iteration.  A ping is a full XRCE round trip, so pinging
+             * every ~10 ms made the loop rate (and the odom publish rate)
+             * RTT-bound and roughly doubled transport traffic.  Between
+             * pings the executor spin drives all traffic and would surface
+             * a dead link; the periodic ping is the explicit liveness check
+             * that tears down + reconnects on loss. */
+            if (now_us - last_ping_us > 1000000LL) {   /* every 1 s */
+                if (rmw_uros_ping_agent(100, 1) != RMW_RET_OK) {
+                    ESP_LOGW(TAG, "agent ping failed — assuming disconnect");
+                    break;
+                }
+                last_ping_us = now_us;
+            }
+
             /* Periodic re-sync for MCU/host crystal drift (~tens of ppm).
              * Non-fatal on timeout — the stored offset stays valid. */
-            int64_t now_us = esp_timer_get_time();
             if (now_us - last_sync_us > 5000000LL) {   /* every 5 s */
                 rmw_uros_sync_session(200);
                 last_sync_us = now_us;
             }
 
-            publish_odom(&odom_pub);
-            publish_failsafe(&failsafe_pub);
+            if (odom_ok)     publish_odom(&odom_pub);
+            if (failsafe_ok) publish_failsafe(&failsafe_pub);
 #ifdef CONFIG_MOTOR_DRIVER_VESC
-            publish_battery(&battery_pub[0], VESC_ID_LEFT,  0);
-            publish_battery(&battery_pub[1], VESC_ID_RIGHT, 1);
+            if (battery_ok[0]) publish_battery(&battery_pub[0], VESC_ID_LEFT,  0);
+            if (battery_ok[1]) publish_battery(&battery_pub[1], VESC_ID_RIGHT, 1);
 #endif
         }
 
-        /* ── Agent lost — cleanup ───────────────────────────────── */
-        ESP_LOGW(TAG, "Agent disconnected, cleaning up...");
+        /* ── Cleanup (agent lost or session setup incomplete) ────── */
+        ESP_LOGW(TAG, "Cleaning up session entities...");
 
-        rclc_executor_fini(&executor);
-        rcl_subscription_fini(&cmd_vel_sub, &node);
+        if (exec_init_ok) rclc_executor_fini(&executor);
+        if (sub_ok)       rcl_subscription_fini(&cmd_vel_sub, &node);
 #ifdef CONFIG_MOTOR_DRIVER_VESC
-        rcl_publisher_fini(&battery_pub[1], &node);
-        rcl_publisher_fini(&battery_pub[0], &node);
+        if (battery_ok[1]) rcl_publisher_fini(&battery_pub[1], &node);
+        if (battery_ok[0]) rcl_publisher_fini(&battery_pub[0], &node);
 #endif
-        rcl_publisher_fini(&failsafe_pub, &node);
-        rcl_publisher_fini(&odom_pub, &node);
+        if (failsafe_ok) rcl_publisher_fini(&failsafe_pub, &node);
+        if (odom_ok)     rcl_publisher_fini(&odom_pub, &node);
         rcl_node_fini(&node);
         rclc_support_fini(&support);
 

@@ -23,10 +23,22 @@ typedef struct {
     mcpwm_cap_channel_handle_t cap_chan;
     uint32_t                   rise_ticks;  /* capture value at rising edge */
     volatile uint16_t          pulse_us;    /* latest pulse width in µs */
-    volatile int64_t           last_edge_us;/* esp_timer timestamp of last edge */
+    atomic_int_least64_t       last_edge_us;/* esp_timer timestamp of last edge.
+                                             * 64-bit: atomic so cross-core reads
+                                             * (Core 0 publish + Core 1 motor task)
+                                             * never tear across the 32-bit boundary
+                                             * on the Xtensa core.  Written only by
+                                             * the capture ISR (single writer). */
 } rc_channel_t;
 
 static rc_channel_t s_ch[3]; /* 0=steering, 1=throttle, 2=mode */
+
+/* Capture-timer resolution in ticks per microsecond.  Queried once at
+ * init from mcpwm_capture_timer_get_resolution() so pulse-width math
+ * tracks the actual clock source / prescale instead of assuming the
+ * 80 MHz APB default.  Written once before any channel is enabled,
+ * then read only by the capture ISR. */
+static uint32_t s_cap_ticks_per_us = 80;
 
 /* ── cmd_vel timeout tracking ───────────────────────────────────── */
 
@@ -45,12 +57,12 @@ static bool IRAM_ATTR capture_cb(mcpwm_cap_channel_handle_t cap_chan,
     } else {
         /* Falling edge — compute pulse width */
         uint32_t delta = edata->cap_value - ch->rise_ticks;
-        /* MCPWM capture timer runs at APB clock (typically 80 MHz) */
-        uint32_t pulse_us = delta / 80; /* 80 ticks per µs at 80 MHz */
+        /* ticks/µs comes from the queried capture-timer resolution. */
+        uint32_t pulse_us = delta / s_cap_ticks_per_us;
         /* Sanity check: valid RC PWM is 800–2200 µs */
         if (pulse_us >= 800 && pulse_us <= 2200) {
             ch->pulse_us    = (uint16_t)pulse_us;
-            ch->last_edge_us = esp_timer_get_time();
+            atomic_store(&ch->last_edge_us, esp_timer_get_time());
         }
     }
     return false; /* no high-priority task woken */
@@ -77,6 +89,21 @@ static esp_err_t init_capture_channel(int idx, int gpio)
 
         ret = mcpwm_capture_timer_start(s_cap_timer);
         if (ret != ESP_OK) return ret;
+
+        /* Derive ticks-per-µs from the actual timer resolution rather
+         * than hardcoding the 80 MHz APB assumption.  Done before any
+         * capture channel is enabled so the ISR always sees a valid
+         * divisor.  Keep the 80 default if the query fails. */
+        uint32_t res_hz = 0;
+        if (mcpwm_capture_timer_get_resolution(s_cap_timer, &res_hz) == ESP_OK
+            && res_hz >= 1000000) {
+            s_cap_ticks_per_us = res_hz / 1000000;
+            ESP_LOGI(TAG, "capture timer %u Hz -> %u ticks/us",
+                     (unsigned)res_hz, (unsigned)s_cap_ticks_per_us);
+        } else {
+            ESP_LOGW(TAG, "capture resolution query failed; assuming %u ticks/us",
+                     (unsigned)s_cap_ticks_per_us);
+        }
     }
     cap_timer = s_cap_timer;
 
@@ -113,7 +140,7 @@ esp_err_t rc_failsafe_init(void)
     /* Initialize pulse values to center (safe default) */
     for (int i = 0; i < 3; i++) {
         s_ch[i].pulse_us    = RC_PWM_CENTER_US;
-        s_ch[i].last_edge_us = 0;
+        atomic_store(&s_ch[i].last_edge_us, 0);
     }
 
     atomic_store(&s_last_cmd_vel_us, 0);
@@ -149,8 +176,9 @@ rc_input_t rc_failsafe_read(void)
     /* Signal OK if any channel had an edge within timeout */
     bool any_recent = false;
     for (int i = 0; i < 3; i++) {
-        int64_t age = now - s_ch[i].last_edge_us;
-        if (s_ch[i].last_edge_us != 0 &&
+        int64_t last_edge = atomic_load(&s_ch[i].last_edge_us);
+        int64_t age = now - last_edge;
+        if (last_edge != 0 &&
             age < (int64_t)RC_SIGNAL_TIMEOUT_MS * 1000) {
             any_recent = true;
             break;

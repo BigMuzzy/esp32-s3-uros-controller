@@ -98,7 +98,7 @@ static bool              s_feedback_valid;
 
 static portMUX_TYPE      s_cmd_mux = portMUX_INITIALIZER_UNLOCKED;
 static motor_wheel_cmd_t s_cmd;          /* latest setpoint from upper layer */
-static bool              s_estop;        /* set by motor_driver_emergency_stop */
+static bool              s_estop;        /* latched by emergency_stop, cleared by clear_emergency_stop */
 
 /* Event group used during boot health check and for runtime arming.
  * Bits mirror the legacy can_task scheme. */
@@ -619,13 +619,10 @@ void motor_driver_set_cmd(const motor_wheel_cmd_t *cmd)
     if (cmd == NULL) return;
     taskENTER_CRITICAL(&s_cmd_mux);
     s_cmd = *cmd;
-    /* Any explicit non-emergency command clears a latched e-stop only
-     * when the caller asks for zero motion AND we are still tripped —
-     * keep e-stop sticky otherwise.  Today the upper layer never
-     * "un-stops" implicitly: it would clear via motor_driver_set_cmd
-     * with zero and the next non-zero command lifts the latch.  Match
-     * the legacy behavior: e-stop is one-shot — clears on next set_cmd. */
-    s_estop = false;
+    /* A latched e-stop is intentionally NOT lifted here.  The control
+     * loop streams a setpoint every tick, so auto-clearing would undo
+     * the stop within one period.  Release is explicit via
+     * motor_driver_clear_emergency_stop(). */
     taskEXIT_CRITICAL(&s_cmd_mux);
 }
 
@@ -635,6 +632,13 @@ void motor_driver_emergency_stop(void)
     s_cmd.left_rpm  = 0.0f;
     s_cmd.right_rpm = 0.0f;
     s_estop = true;
+    taskEXIT_CRITICAL(&s_cmd_mux);
+}
+
+void motor_driver_clear_emergency_stop(void)
+{
+    taskENTER_CRITICAL(&s_cmd_mux);
+    s_estop = false;
     taskEXIT_CRITICAL(&s_cmd_mux);
 }
 

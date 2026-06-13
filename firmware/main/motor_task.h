@@ -37,6 +37,15 @@ extern "C" {
 #define MOTOR_TASK_STACK        4096
 #define MOTOR_TASK_PRIO         5     /* higher than uros_task */
 
+/* Motor feedback older than this is treated as stale.  Odometry then
+ * reports zero wheel velocity instead of freezing the last-known value:
+ * motor_driver_get_feedback() keeps returning the most recent snapshot
+ * forever once any has been seen, so a mid-mission comms dropout would
+ * otherwise keep publishing a stale (possibly non-zero) velocity at the
+ * loop rate.  Both backends refresh feedback well inside this window in
+ * healthy operation (ZLAC TPDO event timer, VESC STATUS broadcasts). */
+#define MOTOR_FEEDBACK_TIMEOUT_MS  200
+
 /* Watchdog timeout for the tune override (ms). */
 #define TUNE_OVERRIDE_TIMEOUT_MS  150
 
