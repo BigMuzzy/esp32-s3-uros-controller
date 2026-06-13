@@ -43,6 +43,7 @@
 #include <nav_msgs/msg/odometry.h>
 #include <sensor_msgs/msg/battery_state.h>
 #include <std_msgs/msg/bool.h>
+#include <std_srvs/srv/trigger.h>
 #include <builtin_interfaces/msg/time.h>
 
 #include <rmw_microxrcedds_c/config.h>
@@ -77,6 +78,8 @@ static void yaw_to_quaternion(float yaw,
 static geometry_msgs__msg__Twist  s_cmd_vel_msg;
 static nav_msgs__msg__Odometry    s_odom_msg;
 static std_msgs__msg__Bool        s_failsafe_msg;
+static std_srvs__srv__Trigger_Request  s_reset_req;
+static std_srvs__srv__Trigger_Response s_reset_res;
 #ifdef CONFIG_MOTOR_DRIVER_VESC
 static sensor_msgs__msg__BatteryState s_battery_msg[2]; /* [0]=LEFT, [1]=RIGHT */
 #endif
@@ -115,6 +118,30 @@ static void cmd_vel_cb(const void *msg_in)
     }
 
     motor_task_set_cmd_vel(&cmd);
+}
+
+/* ── reset_odom service callback ───────────────────────────── */
+
+/* std_srvs/Trigger handler: zero the odom pose without a reboot.  Used
+ * by bench odometry-closure calibration (roadmap M1) so each run can
+ * re-zero between trials.  Pose-only — motor commands are untouched. */
+static void reset_odom_cb(const void *req_in, void *res_out)
+{
+    (void)req_in;
+    std_srvs__srv__Trigger_Response *res =
+        (std_srvs__srv__Trigger_Response *)res_out;
+
+    motor_task_reset_odom();
+
+    /* Static literal — outlives the response serialization; rclc does
+     * not own/free this String. */
+    static const char ok_msg[] = "odom pose reset to origin";
+    res->success          = true;
+    res->message.data     = (char *)ok_msg;
+    res->message.size     = sizeof(ok_msg) - 1;
+    res->message.capacity = sizeof(ok_msg);
+
+    ESP_LOGI(TAG, "reset_odom: pose zeroed");
 }
 
 /* ── Publish helpers ─────────────────────────────────────────────── */
@@ -292,9 +319,22 @@ static void uros_task_fn(void *arg)
             ESP_LOGE(TAG, "cmd_vel subscription init failed: %d", (int)rc);
         }
 
+        /* ── Services ───────────────────────────────────────────── */
+        /* reset_odom (std_srvs/Trigger): zero the odom pose without a
+         * reboot — for bench odometry-closure calibration.  Non-critical:
+         * a failure here is logged but does not block driving. */
+        rcl_service_t reset_odom_srv;
+        rc = rclc_service_init_default(&reset_odom_srv, &node,
+            ROSIDL_GET_SRV_TYPE_SUPPORT(std_srvs, srv, Trigger), "reset_odom");
+        bool reset_srv_ok = (rc == RCL_RET_OK);   /* true ⇒ init'd, needs fini */
+        if (!reset_srv_ok) {
+            ESP_LOGE(TAG, "reset_odom service init failed: %d", (int)rc);
+        }
+
         /* ── Executor ───────────────────────────────────────────── */
+        /* Handles: cmd_vel subscription + reset_odom service. */
         rclc_executor_t executor;
-        rc = rclc_executor_init(&executor, &support.context, 1, &allocator);
+        rc = rclc_executor_init(&executor, &support.context, 2, &allocator);
         bool exec_init_ok = (rc == RCL_RET_OK);
         if (!exec_init_ok) {
             ESP_LOGE(TAG, "executor init failed: %d", (int)rc);
@@ -307,6 +347,16 @@ static void uros_task_fn(void *arg)
             exec_ready = (rc == RCL_RET_OK);
             if (!exec_ready) {
                 ESP_LOGE(TAG, "executor add cmd_vel failed: %d", (int)rc);
+            }
+        }
+        if (exec_init_ok && reset_srv_ok) {
+            rc = rclc_executor_add_service(&executor, &reset_odom_srv,
+                                           &s_reset_req, &s_reset_res,
+                                           &reset_odom_cb);
+            if (rc != RCL_RET_OK) {
+                /* Service stays init'd (still fini'd below); it just won't
+                 * receive requests this session. */
+                ESP_LOGE(TAG, "executor add reset_odom failed: %d", (int)rc);
             }
         }
 
@@ -324,9 +374,10 @@ static void uros_task_fn(void *arg)
         /* ── Static odom covariance diagonals ───────────────────── */
         /* 6x6 row-major [x, y, z, roll, pitch, yaw].  The host EKF
          * weights inputs by covariance; all-zero reads as "infinitely
-         * certain" and breaks fusion once the M2 IMU lands.  The drive
-         * fuses vx + vyaw, so those diagonals matter most; unused 2D
-         * axes (z/roll/pitch) get a large value.  Starting points —
+         * certain" and breaks fusion once a host-side IMU is fused in
+         * (the IMU lives on the main ROS computer, not the ESP32).  The
+         * drive fuses vx + vyaw, so those diagonals matter most; unused
+         * 2D axes (z/roll/pitch) get a large value.  Starting points —
          * tune on the bench against the M1 square-drive closure. */
         s_odom_msg.pose.covariance[0]  = 0.002; /* x     (m^2)    */
         s_odom_msg.pose.covariance[7]  = 0.002; /* y     (m^2)    */
@@ -396,6 +447,7 @@ static void uros_task_fn(void *arg)
         ESP_LOGW(TAG, "Cleaning up session entities...");
 
         if (exec_init_ok) rclc_executor_fini(&executor);
+        if (reset_srv_ok) rcl_service_fini(&reset_odom_srv, &node);
         if (sub_ok)       rcl_subscription_fini(&cmd_vel_sub, &node);
 #ifdef CONFIG_MOTOR_DRIVER_VESC
         if (battery_ok[1]) rcl_publisher_fini(&battery_pub[1], &node);

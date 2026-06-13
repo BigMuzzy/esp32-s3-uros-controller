@@ -1,6 +1,6 @@
 # ADR-0007: CAN Bus Topology & Termination
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-04-19
 
 ## Context

@@ -73,16 +73,22 @@ runs on Core 1 so motor commands are computed and sent with minimal
 latency. Odometry is computed from wheel feedback on Core 1 and published
 via micro-ROS on Core 0.
 
-## FreeRTOS Tasks (planned)
+## FreeRTOS Tasks
 
-| Task              | Core | Rate       | Purpose                              |
-|-------------------|------|------------|--------------------------------------|
-| `uros_task`       | 0    | ~10 ms     | micro-ROS spin, pub/sub, odom pub    |
-| `motor_task`      | 1    | ~20 ms     | Kinematics + arbitration → HAL set   |
-| `zlac_tx` (backend)| 1   | ~20 ms     | RPDO controlword + target velocities |
-| `rc_failsafe_task`| 1    | ~20 ms     | Read RC PWM, arcade mix, failsafe    |
+Tasks for the default ZLAC8015D build (the VESC backend spawns its own
+`motor_vesc_rx` / `motor_vesc_tx` pair instead of `canopen_rx` / `zlac_tx`):
 
-## ROS 2 Interface (planned)
+| Task                  | Core | Rate         | Purpose                               |
+|-----------------------|------|--------------|---------------------------------------|
+| `uros_task`           | 0    | ~10 ms       | micro-ROS spin, pub/sub, odom pub     |
+| `motor_task`          | 1    | ~20 ms       | RC read + arbitration + kinematics + odom |
+| `canopen_rx` (backend)| 1    | event-driven | TWAI RX demux: TPDO / heartbeat / SDO |
+| `zlac_tx` (backend)   | 1    | ~20 ms       | RPDO controlword + target velocities  |
+
+RC failsafe has no task of its own: MCPWM capture ISRs hardware-timestamp
+the PWM edges and `motor_task` polls them each 20 ms tick.
+
+## ROS 2 Interface
 
 | Direction | Topic / Service           | Type                    | Purpose                    |
 |-----------|---------------------------|-------------------------|----------------------------|
@@ -90,22 +96,30 @@ via micro-ROS on Core 0.
 | Pub       | `odom`                    | `nav_msgs/Odometry`     | Wheel odometry             |
 | Pub       | `motor/status`            | TBD                     | Motor telemetry (V, A, T)  |
 | Pub       | `failsafe/active`         | `std_msgs/Bool`         | Failsafe state             |
+| Srv       | `reset_odom`              | `std_srvs/Trigger`      | Zero odom pose (no reboot) |
 
 ## Key Design Decisions
 
 Documented as Architecture Decision Records in [`adr/`](adr/).
 
-| ADR   | Title                              | Status   |
-|-------|------------------------------------|----------|
-| 0001  | Core allocation strategy           | Proposed |
-| 0002  | micro-ROS transport                | Proposed |
-| 0003  | VESC CAN protocol                  | Superseded by 0010 |
-| 0004  | Diff-drive kinematics on ESP32     | Proposed |
-| 0005  | Odometry computation               | Proposed |
-| 0006  | RC failsafe behavior & mixing      | Proposed |
-| 0007  | CAN bus topology & termination     | Proposed |
-| 0008  | Debug console on SH1.0 UART        | Proposed |
-| 0010  | ZLAC8015D CANopen migration        | Accepted |
+| ADR   | Title                              | Status              |
+|-------|------------------------------------|---------------------|
+| 0001  | Core allocation strategy           | Accepted            |
+| 0002  | micro-ROS transport                | Accepted            |
+| 0003  | VESC CAN protocol                  | Superseded by 0010  |
+| 0004  | Diff-drive kinematics on ESP32     | Accepted            |
+| 0005  | Odometry computation               | Accepted            |
+| 0006  | RC failsafe behavior & mixing      | Accepted            |
+| 0007  | CAN bus topology & termination     | Accepted            |
+| 0008  | Debug console on SH1.0 UART        | Accepted            |
+| 0009  | VESC health monitoring & arming    | Accepted            |
+| 0010  | ZLAC8015D CANopen migration        | Accepted            |
+
+## Roadmap
+
+Planned and in-progress work (the `motor/status` topic above, IMU
+fusion, battery telemetry, VESC fault decode, …) is tracked in
+[`ROADMAP.md`](ROADMAP.md).
 
 ## Building & Flashing
 

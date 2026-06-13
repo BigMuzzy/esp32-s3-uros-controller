@@ -1,6 +1,6 @@
 # ADR-0008: Debug Console on SH1.0 UART (GPIO1 / GPIO2)
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-04-20
 
 ## Context

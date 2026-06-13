@@ -1,6 +1,6 @@
 # ADR-0006: RC Failsafe Behavior & Mixing
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-04-10
 
 ## Context

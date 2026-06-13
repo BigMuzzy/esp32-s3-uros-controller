@@ -13,6 +13,10 @@
  * Subscription callback:
  *   cmd_vel → motor_task_set_cmd_vel()  (writes to Core 1)
  *
+ * Service:
+ *   reset_odom (std_srvs/Trigger) → motor_task_reset_odom()
+ *     zeroes the odom pose without a reboot (bench calibration).
+ *
  * All TWAI and GPIO access is delegated to Core 1 modules.
  * This task only touches micro-ROS and shared data accessors.
  *

@@ -74,6 +74,17 @@ void motor_task_set_cmd_vel(const cmd_vel_t *cmd);
  */
 void motor_task_get_odom(odom_state_t *odom_out);
 
+/**
+ * Reset the odometry pose (x, y, theta) to the origin.  Preserves the
+ * wheel-revolution baseline and instantaneous velocity, so the next
+ * control tick computes a correct near-zero delta instead of a jump.
+ * Pose-only: does not touch motor commands.  Thread-safe.
+ *
+ * Intended for bench odometry-closure calibration (roadmap M1): each
+ * trial can re-zero the pose without rebooting the controller.
+ */
+void motor_task_reset_odom(void);
+
 /* ── Tune-mode override ─────────────────────────────────────────── */
 
 /**

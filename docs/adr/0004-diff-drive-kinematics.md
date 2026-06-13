@@ -1,6 +1,6 @@
 # ADR-0004: Diff-Drive Kinematics on ESP32
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-04-10
 
 ## Context

@@ -214,6 +214,13 @@ void motor_task_get_odom(odom_state_t *odom_out)
     taskEXIT_CRITICAL(&s_odom_mux);
 }
 
+void motor_task_reset_odom(void)
+{
+    taskENTER_CRITICAL(&s_odom_mux);
+    diff_drive_reset_odom(&s_odom);
+    taskEXIT_CRITICAL(&s_odom_mux);
+}
+
 void motor_task_set_tune_override(float left_rpm, float right_rpm)
 {
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);

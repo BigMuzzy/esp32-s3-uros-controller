@@ -1,6 +1,6 @@
 # ADR-0002: micro-ROS Transport
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-04-10
 
 ## Context

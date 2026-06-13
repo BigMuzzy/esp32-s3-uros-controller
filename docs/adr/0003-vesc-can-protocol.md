@@ -1,6 +1,6 @@
 # ADR-0003: VESC CAN Protocol
 
-**Status:** Proposed
+**Status:** Superseded by ADR-0010 (VESC backend retained as a legacy build option)
 **Date:** 2026-04-10
 
 ## Context

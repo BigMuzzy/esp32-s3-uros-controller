@@ -1,6 +1,6 @@
 # ADR-0005: Odometry Computation
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-04-10
 
 ## Context
@@ -169,5 +169,8 @@ micro-ROS supports TF publishing, but:
   PC should fuse with IMU and/or lidar for corrected localization.
 - The odom publish rate is coupled to VESC status broadcast rate.
   If VESC status rate is changed in VESC Tool, odom rate follows.
-- `diff_drive_reset_odom()` should be callable via a micro-ROS
-  service in the future if the host needs to reset the pose.
+- `diff_drive_reset_odom()` is exposed over micro-ROS as the
+  `reset_odom` service (`std_srvs/Trigger`), so the host can zero the
+  pose without rebooting the controller. It resets x/y/theta only,
+  keeping the wheel-revolution baseline so the next tick computes a
+  correct delta. Primarily used for bench odometry-closure calibration.

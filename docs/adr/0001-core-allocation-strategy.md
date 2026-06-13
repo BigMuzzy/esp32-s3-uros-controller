@@ -1,6 +1,6 @@
 # ADR-0001: Core Allocation Strategy
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-04-10
 
 ## Context
