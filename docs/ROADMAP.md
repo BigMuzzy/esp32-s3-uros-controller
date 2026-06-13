@@ -53,6 +53,9 @@ Named in the odometry covariance comment of
   pose/twist covariance diagonals against measured drift closure. This
   is a firmware/bench task. The `reset_odom` service
   (`std_srvs/Trigger`) zeroes the pose between trials without a reboot.
+  Procedure + tooling: [odometry-calibration.md](odometry-calibration.md)
+  and the `scripts/calibration_drive.py` / `scripts/calibrate_constants.py`
+  helpers.
 
 (Host-side IMU/EKF fusion is intentionally *not* tracked here — the IMU
 and the fusion live on the main ROS computer, so the firmware has no

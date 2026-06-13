@@ -10,5 +10,9 @@ esp32-s3-uros-driver-backups/
 # ESP-IDF
 sdkconfig.old
 
+# Python (calibration scripts)
+__pycache__/
+*.pyc
+
 # IDE
 .vscode/
