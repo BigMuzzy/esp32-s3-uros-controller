@@ -47,6 +47,14 @@ of how far you drove.
 > (`std_srvs/Trigger`) removes that — see
 > [ADR-0005](adr/0005-odometry-computation.md).
 
+> **`reset_odom` times out (firmware log shows `pose zeroed`)?** The request
+> reached the firmware but the *reply* was dropped. The micro-ROS agent speaks
+> Fast DDS, and service reply correlation does not work cross-vendor (a Cyclone
+> DDS client ↔ Fast DDS agent) even though topics do. `calibration_drive.py`
+> works around this by defaulting `RMW_IMPLEMENTATION=rmw_fastrtps_cpp` (set
+> `CALIB_RMW=keep` to opt out). For manual calls, match the agent's vendor:
+> `RMW_IMPLEMENTATION=rmw_fastrtps_cpp ros2 service call /reset_odom std_srvs/srv/Trigger`.
+
 ## Step 1 — Wheel diameter (straight line)
 
 Isolate translation. Do **not** start with the square — it conflates the
@@ -70,20 +78,44 @@ the free variable here.)
 
 ## Step 2 — Track width (in-place spin)
 
-Isolate rotation.
+Isolate rotation. Mark **two** datums on the floor (plumb-bob / down-laser):
+
+- `A` = the drive-axle centre (the spin centre),
+- `B` = a second centreline point, e.g. the front, a fixed body distance
+  `L = |A B|` ahead of `A`.
+
+Measure `L` once with a tape.
 
 ```bash
-./scripts/calibration_drive.py spin --turns 10
+./scripts/calibration_drive.py spin --turns 10 --baseline 0.40
 ```
 
-Resets odom, spins until odom reads 3600°, stops. Read the **physical**
-rotation — count full turns plus the leftover angle the chassis mark
-stopped at — and enter it. The tool prints the corrected `TRACK_WIDTH_M`.
-Edit, rebuild, reflash as above.
+Resets odom, spins until odom reads 3600°, stops. Instead of reading the
+leftover angle with a protractor, **measure it from a distance**: an
+in-place spin turns about `A`, so the front datum `B` rides a circle of
+radius `L` and the chord between its start and end marks gives the angle:
 
-> Closing on odom stops the robot at an awkward partial angle. If you
-> prefer a clean integer ground truth, spin until the chassis mark
-> visually lines up after N turns, then read odom and pass the numbers to
+$$\theta_\text{leftover} = 2\arcsin\!\left(\frac{|B\,B'|}{2L}\right)$$
+
+Re-mark the front datum as `B'` after the spin, then enter:
+
+1. the **full turns** you counted (the mark passing the start; Enter
+   accepts the commanded count),
+2. the baseline `L` (or pass `--baseline`),
+3. the chord `|B → B'|` (tape),
+4. whether the front mark stopped **past** or **short** of the start in
+   the spin direction (one glance — fixes the sign).
+
+The tool computes the physical total (`turns × 360° + leftover`) and prints
+the corrected `TRACK_WIDTH_M`. Edit, rebuild, reflash as above.
+
+> Keep the leftover under 180° (stop within half a turn of an integer
+> count) so the chord is unambiguous. Offline equivalent:
+> `calibrate_constants.py spin-marks --odom-deg 3600 --turns 10
+> --baseline 0.40 --chord 0.098 [--short]`.
+
+> Prefer a clean integer ground truth instead? Spin until the chassis mark
+> visually lines up after N turns, read odom, and pass the numbers to
 > `calibrate_constants.py track` directly.
 
 ## Step 3 — Square drive (validate + covariance)
@@ -98,8 +130,52 @@ residual. This is the UMBmark benchmark.
 
 For each run the tool resets odom and drives a square (4 sides + 4
 turns), ending where odom *believes* it is back at the start. You then
-tape-measure the **physical** gap from the start mark (x, y, heading).
-It runs `--trials` times clockwise and counter-clockwise.
+capture the **physical** closure pose from tape distances between floor
+marks. It runs `--trials` times clockwise and counter-clockwise.
+
+### Measuring the closure (four distances, no protractor)
+
+The closure is a **pose** error, not just a distance — a single point only
+captures x and y and silently drops the yaw error (the robot can sit
+dead-on the start point while rotated several degrees). Reading that yaw
+with a protractor on the floor is awkward, so capture the whole pose from
+**distances**, which a tape reads quickly and precisely.
+
+Mark **two** datums (same as the spin test):
+
+1. **Position datum** `A` — the drive-axle centre. Plumb-bob / down-laser
+   it and mark the floor.
+2. **Heading datum** `B` — a second centreline point (e.g. the front), a
+   fixed body distance `L = |A B|` ahead of `A`. The line `A → B` is the
+   start heading. Measure `L` once.
+
+After the square, re-mark the same two points as `A'` and `B'` and tape
+these **four** distances:
+
+```
+              |A → A'|   |B → A'|     (locate A')
+              |A → B'|   |B → B'|     (locate B')
+```
+
+Four mutual distances fix the configuration up to a mirror across the
+start heading line, so add **one glance**: did the end pose fall to the
+**left** or **right** of the start heading? (For a few-cm closure offset
+this is obvious — unlike the yaw angle, which is why we stopped reading
+it directly.) That one bit resolves the sign of both `y` and `heading`.
+
+```
+start:                  end (exaggerated):
+   B                         B'
+   |  ← heading                \   ← rotated by heading error
+   A  ← position datum      A' ·····→ offset (x fwd, y left) from A
+```
+
+The tool solves the rigid transform and prints the signed closure in the
+start frame (`x` = +forward, `y` = +left, `heading` = +CCW). It also
+prints a tape-consistency check `||A'B'| − L|`; if that is large you
+mis-read a distance — re-measure. Offline equivalent:
+`calibrate_constants.py closure -L 0.40 --aa .. --bb .. --ab .. --ba ..
+--side left`.
 
 Interpreting the closure errors (printed at the end):
 
@@ -127,4 +203,12 @@ If you already have measurements, skip the driver:
 ./scripts/calibrate_constants.py wheel --odom 5.00 --tape 4.82
 ./scripts/calibrate_constants.py track --odom-deg 3600 --physical-deg 3540
 ./scripts/calibrate_constants.py cov --csv closures.csv   # x,y,theta_deg per line
+
+# distance-only variants (no protractor):
+#   spin leftover from the front-datum chord -> TRACK_WIDTH_M
+./scripts/calibrate_constants.py spin-marks --odom-deg 3600 --turns 10 \
+    --baseline 0.40 --chord 0.098
+#   one square closure from four floor-mark distances -> x,y,theta row
+./scripts/calibrate_constants.py closure -L 0.40 \
+    --aa 0.21 --ba 0.43 --ab 0.45 --bb 0.19 --side left
 ```

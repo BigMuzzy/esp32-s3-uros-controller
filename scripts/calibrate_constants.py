@@ -24,6 +24,15 @@ Usage
     # in-place spin test → track width
     ./calibrate_constants.py track --odom-deg 3600 --physical-deg 3540
 
+    # spin via the front-datum chord (no protractor): 10 turns, L=0.40 m,
+    # chord |B B'| = 0.098 m, mark stopped just past the start
+    ./calibrate_constants.py spin-marks --odom-deg 3600 --turns 10 \
+        --baseline 0.40 --chord 0.098
+
+    # one square closure from four tape distances between floor marks
+    ./calibrate_constants.py closure -L 0.40 --aa 0.21 --bb 0.19 \
+        --ab 0.45 --ba 0.43 --side left
+
     # square closure errors → covariance diagonals
     #   CSV: one "x,y,theta_deg" closure error per line (or stdin)
     ./calibrate_constants.py cov --csv closures.csv
@@ -43,8 +52,8 @@ from typing import List, Tuple
 # Current compile-time defaults from firmware/main/diff_drive.h.  Used as
 # the baseline a correction scales; override with --current if your tree
 # already differs.
-DEFAULT_WHEEL_DIAMETER_M = 0.170
-DEFAULT_TRACK_WIDTH_M = 0.600
+DEFAULT_WHEEL_DIAMETER_M = 0.17068
+DEFAULT_TRACK_WIDTH_M    = 0.52132
 
 
 def corrected_wheel_diameter(current_m: float,
@@ -109,6 +118,105 @@ def closure_stats(closures: List[Tuple[float, float, float]]) -> dict:
         "var_y": var(ys),
         "var_theta": var(ths),
     }
+
+
+# ── distance-only pose readout ───────────────────────────────────────
+#
+# Measuring a planar closure (x, y, heading) with a protractor is the
+# cumbersome part of the bench procedure.  Distances are easier and more
+# precise to read with a tape, so capture the pose from tape distances
+# between two start datums and their end marks instead.
+#
+# Datums (mark on the floor with a plumb-bob / down-laser):
+#   A  = position datum   — the drive-axle centre (the spin centre).
+#   B  = heading datum     — a second centreline point (e.g. the front),
+#                            a fixed body distance L = |A B| ahead of A.
+# After the motion, re-mark the same two points as A' and B'.
+#
+# Start frame: A at the origin, B on +x at L, so +x is FORWARD and +y is
+# LEFT (matches the closure sign convention used by closure_stats).
+
+
+def pose_from_marks(baseline_m: float,
+                    d_aa: float, d_bb: float,
+                    d_ab: float, d_ba: float,
+                    side: float = 1.0) -> Tuple[float, float, float, float]:
+    """Signed planar closure from four tape distances between floor marks.
+
+    ``baseline_m`` is the body distance L = |A B|.  The four distances are::
+
+        d_aa = |A A'|   d_ba = |B A'|     (locate A')
+        d_ab = |A B'|   d_bb = |B B'|     (locate B')
+
+    Four mutual distances fix the configuration only up to a reflection
+    across the start-heading line (A-B); ``side`` resolves it: +1 if the
+    end pose fell to the LEFT of the start heading, -1 if to the RIGHT.
+
+    Returns ``(dx, dy, dtheta_deg, baseline_residual_m)`` in the start
+    frame: ``dx`` = +forward, ``dy`` = +left, ``dtheta_deg`` = +CCW.
+    ``baseline_residual_m`` is ``| |A'B'| - L |`` — a tape-consistency
+    check; a large value means a mis-measured distance, re-read the tape.
+    """
+    L = float(baseline_m)
+    if L <= 0:
+        raise ValueError("baseline (|A B|) must be > 0")
+
+    # A' and B' each lie at the intersection of two circles centred on the
+    # start datums A=(0,0) and B=(L,0); solve the x first (unambiguous),
+    # then the y magnitude.
+    xa = (d_aa ** 2 - d_ba ** 2 + L ** 2) / (2.0 * L)
+    xb = (d_ab ** 2 - d_bb ** 2 + L ** 2) / (2.0 * L)
+    ya_mag = math.sqrt(max(0.0, d_aa ** 2 - xa ** 2))
+    yb_mag = math.sqrt(max(0.0, d_ab ** 2 - xb ** 2))
+
+    # The relative sign of (ya, yb) is fixed by the rigid constraint
+    # |A'B'| = L; pick the combination that satisfies it best.
+    best = None
+    for sa in (1.0, -1.0):
+        for sb in (1.0, -1.0):
+            ya, yb = sa * ya_mag, sb * yb_mag
+            err = abs(math.hypot(xb - xa, yb - ya) - L)
+            if best is None or err < best[0]:
+                best = (err, sa, sb)
+    _, sa, sb = best
+
+    # Apply the global left/right `side` via the more reliable (longer) y
+    # arm; the two valid solutions are exact mirrors, so flip both signs
+    # together.
+    want = math.copysign(1.0, side if side != 0 else 1.0)
+    if ya_mag >= yb_mag:
+        if sa != want:
+            sa, sb = -sa, -sb
+    else:
+        if sb != want:
+            sa, sb = -sa, -sb
+    ya, yb = sa * ya_mag, sb * yb_mag
+
+    dtheta = math.degrees(math.atan2(yb - ya, xb - xa))
+    residual = abs(math.hypot(xb - xa, yb - ya) - L)
+    return xa, ya, dtheta, residual
+
+
+def leftover_from_chord(baseline_m: float, chord_m: float,
+                        past: bool = True) -> float:
+    """Spin leftover angle (deg) from the front-datum chord |B B'|.
+
+    An in-place spin turns about the axle centre, so the front datum B
+    (radius L = ``baseline_m`` from the centre) moves along a circle and
+    ``chord = 2 L sin(theta/2)``.  ``past`` is the spin-direction sign: the
+    front mark stopped just PAST the start (True, +) or SHORT of it
+    (False, -).  Magnitude only — keep the leftover under 180 deg (stop
+    within half a turn of an integer count) so the chord is unambiguous.
+    """
+    L = float(baseline_m)
+    if L <= 0:
+        raise ValueError("baseline (|A B|) must be > 0")
+    ratio = chord_m / (2.0 * L)
+    if ratio > 1.0 + 1e-6:
+        raise ValueError(
+            f"chord {chord_m:.4f} m > 2L ({2 * L:.4f} m): check L or the chord")
+    mag = math.degrees(2.0 * math.asin(min(1.0, max(0.0, ratio))))
+    return mag if past else -mag
 
 
 # ── CLI ──────────────────────────────────────────────────────────────
@@ -181,6 +289,41 @@ def _cmd_cov(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_closure(args: argparse.Namespace) -> int:
+    side = 1.0 if args.side == "left" else -1.0
+    dx, dy, dth, resid = pose_from_marks(
+        args.baseline, args.aa, args.bb, args.ab, args.ba, side)
+    print("square closure from marks:")
+    print(f"  baseline L = |A B|      : {args.baseline:.4f} m")
+    print(f"  end pose fell to the    : {args.side}")
+    print(f"  closure x (fwd)  : {dx:+.4f} m")
+    print(f"  closure y (left) : {dy:+.4f} m")
+    print(f"  closure heading  : {dth:+.2f} deg")
+    print(f"  tape check ||A'B'|-L|   : {resid:.4f} m", end="")
+    if resid > max(0.02, 0.03 * args.baseline):
+        print("   <-- LARGE: re-read a distance")
+    else:
+        print("   (ok)")
+    print()
+    print("  append this row to your closures CSV (x,y,theta_deg):")
+    print(f"    {dx:.4f},{dy:.4f},{dth:.2f}")
+    return 0
+
+
+def _cmd_spin_marks(args: argparse.Namespace) -> int:
+    leftover = leftover_from_chord(args.baseline, args.chord, past=not args.short)
+    physical = args.turns * 360.0 + leftover
+    print("in-place spin test (chord readout):")
+    print(f"  full turns counted : {args.turns:g}  ({args.turns * 360.0:.0f} deg)")
+    print(f"  baseline L = |A B| : {args.baseline:.4f} m")
+    print(f"  chord |B B'|       : {args.chord:.4f} m -> leftover "
+          f"{leftover:+.2f} deg ({'short' if args.short else 'past'})")
+    print(f"  physical total     : {physical:.2f} deg")
+    print()
+    return _cmd_track(argparse.Namespace(
+        odom_deg=args.odom_deg, physical_deg=physical, current=args.current))
+
+
 def main(argv: List[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         description="Convert bench odometry measurements into diff-drive "
@@ -213,6 +356,37 @@ def main(argv: List[str] | None = None) -> int:
                     help="CSV of 'x,y,theta_deg' closure errors, one per "
                          "line ('-' = stdin, the default)")
     pc.set_defaults(func=_cmd_cov)
+
+    pcl = sub.add_parser(
+        "closure",
+        help="four tape distances between floor marks -> x,y,theta closure")
+    pcl.add_argument("--baseline", "-L", type=float, required=True,
+                     help="body distance |A B| between the two datums (m)")
+    pcl.add_argument("--aa", type=float, required=True, help="|A A'| (m)")
+    pcl.add_argument("--bb", type=float, required=True, help="|B B'| (m)")
+    pcl.add_argument("--ab", type=float, required=True, help="|A B'| (m)")
+    pcl.add_argument("--ba", type=float, required=True, help="|B A'| (m)")
+    pcl.add_argument("--side", choices=("left", "right"), required=True,
+                     help="which side of the start heading the end pose fell")
+    pcl.set_defaults(func=_cmd_closure)
+
+    psm = sub.add_parser(
+        "spin-marks",
+        help="spin leftover from the front-datum chord -> TRACK_WIDTH_M")
+    psm.add_argument("--odom-deg", type=float, required=True, dest="odom_deg",
+                     help="total yaw odom reported (deg)")
+    psm.add_argument("--turns", type=float, required=True,
+                     help="full turns you counted (e.g. 10)")
+    psm.add_argument("--baseline", "-L", type=float, required=True,
+                     help="axle-centre -> front datum distance |A B| (m)")
+    psm.add_argument("--chord", type=float, required=True,
+                     help="chord |B B'| between start/end front marks (m)")
+    psm.add_argument("--short", action="store_true",
+                     help="front mark stopped SHORT of start (default: past)")
+    psm.add_argument("--current", type=float, default=DEFAULT_TRACK_WIDTH_M,
+                     help=f"current TRACK_WIDTH_M (default "
+                          f"{DEFAULT_TRACK_WIDTH_M})")
+    psm.set_defaults(func=_cmd_spin_marks)
 
     args = p.parse_args(argv)
     try:

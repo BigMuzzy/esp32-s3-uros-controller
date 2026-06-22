@@ -377,14 +377,15 @@ static void uros_task_fn(void *arg)
          * certain" and breaks fusion once a host-side IMU is fused in
          * (the IMU lives on the main ROS computer, not the ESP32).  The
          * drive fuses vx + vyaw, so those diagonals matter most; unused
-         * 2D axes (z/roll/pitch) get a large value.  Starting points —
-         * tune on the bench against the M1 square-drive closure. */
-        s_odom_msg.pose.covariance[0]  = 0.002; /* x     (m^2)    */
-        s_odom_msg.pose.covariance[7]  = 0.002; /* y     (m^2)    */
-        s_odom_msg.pose.covariance[14] = 1e6;   /* z     (unused) */
-        s_odom_msg.pose.covariance[21] = 1e6;   /* roll  (unused) */
-        s_odom_msg.pose.covariance[28] = 1e6;   /* pitch (unused) */
-        s_odom_msg.pose.covariance[35] = 0.01;  /* yaw   (rad^2)  */
+         * 2D axes (z/roll/pitch) get a large value.  x/y/yaw measured from
+         * the M1 square-drive closure (2026-06-21, smooth floor — optimistic
+         * vs outdoor terrain; re-measure on the real surface). */
+        s_odom_msg.pose.covariance[0]  = 0.00096; /* x     (m^2)    */
+        s_odom_msg.pose.covariance[7]  = 0.00060; /* y     (m^2)    */
+        s_odom_msg.pose.covariance[14] = 1e6;     /* z     (unused) */
+        s_odom_msg.pose.covariance[21] = 1e6;     /* roll  (unused) */
+        s_odom_msg.pose.covariance[28] = 1e6;     /* pitch (unused) */
+        s_odom_msg.pose.covariance[35] = 0.00054; /* yaw   (rad^2)  */
 
         s_odom_msg.twist.covariance[0]  = 0.001; /* vx    (m/s)^2    */
         s_odom_msg.twist.covariance[7]  = 1e6;   /* vy    (non-holo)*/

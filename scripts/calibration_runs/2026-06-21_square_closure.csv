@@ -1,0 +1,23 @@
+# Odometry square-closure calibration run
+# Date: 2026-06-21  (redo scheduled 2026-06-22)
+# Baseline L = |A B| = 0.6235 m   (A = axle centre, B = front centreline datum)
+# Square: --side 1.5 --trials 2   (2 runs per direction)
+#
+# NOTE: left/right side was corrected after capture — original entries
+#       r,r,l,l were flipped to l,l,r,r (this file holds the corrected values).
+# NOTE: closures are LARGE (|theta| ~ 24 deg, x ~ +0.35 m). Treat as not-yet-
+#       calibrated: redo Step 1 (straight) + Step 2 (spin), reflash, then re-run
+#       the square. These covariance diagonals are bias-dominated, not final.
+#
+# Columns (data rows): x_fwd_m, y_left_m, theta_deg   (start frame: +x fwd, +y left, +CCW)
+# Raw tape distances for each run are in the preceding comment:
+#   dAA=|A A'|  dBA=|B A'|  dAB=|A B'|  dBB=|B B'|  (metres)  side  tapeChk=||A'B'|-L|
+#
+# CW  run 1  side=left   dAA=0.44   dBA=0.3795  dAB=0.929   dBB=0.3055  tapeChk=0.012
+0.3515,0.2647,-24.62
+# CW  run 2  side=left   dAA=0.461  dBA=0.377   dAB=0.9365  dBB=0.3135  tapeChk=0.001
+0.3682,0.2774,-24.24
+# CCW run 1  side=right  dAA=0.389  dBA=0.4125  dAB=0.887   dBB=0.265   tapeChk=0.005
+0.2966,-0.2516,20.29
+# CCW run 2  side=right  dAA=0.517  dBA=0.402   dAB=0.969   dBB=0.350   tapeChk=0.004
+0.3965,-0.3318,24.69
