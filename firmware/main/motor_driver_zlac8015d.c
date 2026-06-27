@@ -543,10 +543,98 @@ static bool bring_up_drive(void)
 
 /* ---- periodic TX task: RPDO0 (controlword) + RPDO1 (targets) --------- */
 
+/* Interval between re-connection attempts while the drive is offline.
+ * A single attempt already blocks up to ZLAC_READY_TIMEOUT_MS probing for
+ * the drive, so this is the additional idle gap inserted between tries. */
+#define ZLAC_RECONNECT_INTERVAL_MS  1000U
+
+/* Refresh the cached heartbeat snapshot from the CANopen layer and report
+ * whether a heartbeat has arrived recently.  The drive's producer heartbeat
+ * (0x1017) is enabled during bring-up; if it stops (drive power loss or
+ * reboot) the snapshot goes stale and we treat the link as down. */
+static bool poll_heartbeat_fresh(void)
+{
+    canopen_nmt_state_t nmt = CANOPEN_NMT_STATE_BOOTUP;
+    uint32_t hb_ms = 0;
+    bool have = canopen_get_heartbeat(ZLAC_NODE, &nmt, &hb_ms);
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    if (have) {
+        s_heartbeat_seen    = true;
+        s_last_heartbeat_ms = hb_ms;
+    }
+    bool fresh = s_heartbeat_seen &&
+                 (now_ms() - s_last_heartbeat_ms) < ZLAC_HEARTBEAT_TIMEOUT;
+    xSemaphoreGive(s_lock);
+    return fresh;
+}
+
 static void tx_task(void *arg)
 {
     (void)arg;
+
+    /* Connection supervisor state.  The drive can be powered on after the
+     * ESP32 (or power-cycled at runtime), so bring-up is owned here rather
+     * than being a one-shot at init: keep retrying until the drive answers,
+     * and re-run the full sequence whenever an established link drops. */
+    bool     first_bringup      = true;
+    uint32_t last_reconnect_ms  = 0;
+    uint32_t last_bringup_ok_ms = 0;
+
     while (1) {
+        bool hb_fresh = poll_heartbeat_fresh();
+
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        bool booted = s_boot_passed;
+        xSemaphoreGive(s_lock);
+
+        /* Detect loss of an established link: heartbeat went stale after we
+         * were up.  The post-bring-up grace window (last_bringup_ok_ms)
+         * avoids a false trip before the drive's first periodic heartbeat
+         * arrives. */
+        if (booted && !hb_fresh &&
+            (now_ms() - last_bringup_ok_ms) >= ZLAC_HEARTBEAT_TIMEOUT) {
+            ESP_LOGW(TAG, "drive heartbeat lost; marking offline and "
+                          "re-establishing connection");
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            s_boot_passed = false;
+            xSemaphoreGive(s_lock);
+            booted = false;
+        }
+
+        if (!booted) {
+            /* Offline: (re)connect on a throttled cadence, then skip the
+             * RPDO TX below — there is nothing configured to drive yet. */
+            if (now_ms() - last_reconnect_ms >= ZLAC_RECONNECT_INTERVAL_MS) {
+                last_reconnect_ms = now_ms();
+                bool ok;
+                if (first_bringup) {
+                    /* First attempt runs the rich, multi-try bring-up with
+                     * bus diagnostics + node scan so wiring / node-ID faults
+                     * are surfaced once. */
+                    first_bringup = false;
+                    ok = bring_up_drive();
+                } else {
+                    ESP_LOGI(TAG, "re-attempting drive bring-up...");
+                    ok = bring_up_sequence();
+                    if (!ok) {
+                        /* Clear a bus-off latched by a no-ACK storm so the
+                         * next probe can succeed once the drive powers up. */
+                        canopen_bus_recover();
+                    }
+                }
+                if (ok) {
+                    xSemaphoreTake(s_lock, portMAX_DELAY);
+                    s_boot_passed = true;
+                    xSemaphoreGive(s_lock);
+                    last_bringup_ok_ms = now_ms();
+                    ESP_LOGI(TAG, "drive connection established");
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(ZLAC_TX_TICK_MS));
+            continue;
+        }
+
         xSemaphoreTake(s_lock, portMAX_DELAY);
 
         /* Translate wheel-side cmd_vel into motor RPM per axis. */
@@ -597,16 +685,6 @@ static void tx_task(void *arg)
         memcpy(&v_frame[4], &bus_r, 4);
         canopen_send_pdo(0x300 + ZLAC_NODE, v_frame, 8);
 
-        /* Pull the freshest heartbeat snapshot for the offline check. */
-        canopen_nmt_state_t nmt = CANOPEN_NMT_STATE_BOOTUP;
-        uint32_t hb_ms = 0;
-        if (canopen_get_heartbeat(ZLAC_NODE, &nmt, &hb_ms)) {
-            xSemaphoreTake(s_lock, portMAX_DELAY);
-            s_heartbeat_seen      = true;
-            s_last_heartbeat_ms   = hb_ms;
-            xSemaphoreGive(s_lock);
-        }
-
         vTaskDelay(pdMS_TO_TICKS(ZLAC_TX_TICK_MS));
     }
 }
@@ -637,11 +715,15 @@ esp_err_t motor_driver_init(void)
         return err;
     }
 
-    s_boot_passed = bring_up_drive();
-    if (!s_boot_passed) {
-        ESP_LOGE(TAG, "bring-up failed; backend will stay disarmed");
-        /* still spawn tx task so health telemetry remains queryable */
-    }
+    /* Drive bring-up — and all subsequent re-connection — is owned by
+     * tx_task's supervisor loop below, so the drive may be powered on
+     * before OR after the ESP32 and the link still comes up.  Start
+     * disarmed; tx_task sets s_boot_passed once the drive answers and
+     * re-runs the bring-up automatically if the drive later drops off the
+     * bus.  Keeping init non-blocking lets the control + micro-ROS tasks
+     * (and their telemetry) start immediately even when the drive is
+     * absent at boot. */
+    s_boot_passed = false;
 
     BaseType_t ok = xTaskCreatePinnedToCore(
         tx_task, "zlac_tx", 4096, NULL, 6, &s_tx_task, 1);  /* prio 6:
@@ -652,15 +734,13 @@ esp_err_t motor_driver_init(void)
     }
 
     s_initialised = true;
-    /* A failed boot health check is NOT a fatal init error: per the HAL
-     * contract the backend stays queryable (boot_passed=false, set_cmd a
-     * no-op) so app_main keeps the control + micro-ROS tasks running and
-     * diagnostics keep publishing.  The drive may simply power up slower
-     * than our bring-up retries; reporting ESP_FAIL here would make
-     * app_main return and brick an otherwise-recoverable robot.  Only
+    /* An absent drive is NOT a fatal init error: per the HAL contract the
+     * backend stays queryable (boot_passed=false, set_cmd a no-op) so
+     * app_main keeps the control + micro-ROS tasks running and diagnostics
+     * keep publishing while tx_task waits for the drive to appear.  Only
      * genuine resource/transport failures above return an error.  This
-     * matches the VESC backend, which also returns ESP_OK on a failed
-     * boot health check. */
+     * matches the VESC backend, which also returns ESP_OK on a failed boot
+     * health check. */
     return ESP_OK;
 }
 
