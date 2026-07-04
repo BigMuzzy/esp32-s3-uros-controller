@@ -87,7 +87,7 @@ try:
         corrected_track_width,
         closure_stats,
         pose_from_marks,
-        leftover_from_chord,
+        leftover_from_chords,
         DEFAULT_WHEEL_DIAMETER_M,
         DEFAULT_TRACK_WIDTH_M,
     )
@@ -95,7 +95,7 @@ try:
 except ImportError:
     _HAVE_MATH = False
     DEFAULT_WHEEL_DIAMETER_M = 0.17037
-    DEFAULT_TRACK_WIDTH_M = 0.513
+    DEFAULT_TRACK_WIDTH_M = 0.54481
 
 
 class Abort(Exception):
@@ -417,9 +417,11 @@ def run_spin(node: CalibrationDriver, args: argparse.Namespace) -> int:
         return _run_spin_constant(node, args, total_deg)
     print(f"\n=== SPIN test: rotate {args.turns:g} turns "
           f"({total_deg:.0f} deg) in place ===")
-    print("Mark TWO datums on the floor with a plumb-bob / down-laser:")
-    print("  A = axle centre (the spin centre)   B = front centreline point")
-    print("  measure L = |A B| once (axle->front), passed via --baseline "
+    print("Mark TWO centreline datums on the floor "
+          "(plumb-bob / down-laser):")
+    print("  B = BACK centreline point   F = FRONT centreline point")
+    print("  (chassis ends sit on the centreline; no axle centre needed.)")
+    print("  measure L = |B F| once (back->front), passed via --baseline "
           "or prompted.")
     input("Press Enter to reset odom and spin (Ctrl-C aborts)... ")
     node.reset_odom()
@@ -427,22 +429,28 @@ def run_spin(node: CalibrationDriver, args: argparse.Namespace) -> int:
     node.rotate_angle(direction * math.radians(total_deg), args.angular_speed)
     odom_deg = abs(node.odom_yaw_deg())
     print(f"\nodom reported {odom_deg:.2f} deg of rotation.")
-    print("Re-mark the front datum as B'. Distance-only readout (no protractor):")
+    print("Re-mark BOTH datums as B' and F'. "
+          "Distance-only readout (no protractor):")
     # default the counted turns to the commanded count (Enter to accept)
     raw = input(f"Full turns you counted [{args.turns:g}]: ").strip()
     full = float(raw) if raw else float(args.turns)
     L = args.baseline if args.baseline else _prompt_float(
-        "Baseline L = |A B| axle->front (m): ")
-    chord = _prompt_float("Chord |B -> B'| between start/end front marks (m): ")
+        "Baseline L = |B F| back->front (m): ")
+    chord_front = _prompt_float(
+        "Chord |F -> F'| between start/end FRONT marks (m): ")
+    chord_back = _prompt_float(
+        "Chord |B -> B'| between start/end BACK marks (m): ")
     past = _prompt_choice(
-        "Front mark stopped PAST or SHORT of start (in spin direction)?",
+        "Marks stopped PAST or SHORT of start (in spin direction)?",
         {"p": True, "past": True, "s": False, "short": False})
     if _HAVE_MATH:
-        leftover = leftover_from_chord(L, chord, past=past)
+        leftover = leftover_from_chords(L, chord_front, chord_back, past=past)
         physical = full * 360.0 + leftover
         new = corrected_track_width(args.current_width, odom_deg, physical)
         ratio = odom_deg / physical
-        print(f"\n  leftover from chord  : {leftover:+.2f} deg "
+        print(f"\n  chords |F F'|+|B B'| : "
+              f"{chord_front + chord_back:.4f} m")
+        print(f"  leftover from chords : {leftover:+.2f} deg "
               f"({'past' if past else 'short'})")
         print(f"  physical total       : {physical:.2f} deg")
         print(f"  scale (odom/physical): {ratio:.5f}  "
@@ -454,7 +462,8 @@ def run_spin(node: CalibrationDriver, args: argparse.Namespace) -> int:
         sgn = "" if past else "--short "
         print(f"  feed to: calibrate_constants.py spin-marks "
               f"--odom-deg {odom_deg:.2f} --turns {full:g} "
-              f"--baseline {L:.4f} --chord {chord:.4f} {sgn}".rstrip())
+              f"--baseline {L:.4f} --chord-front {chord_front:.4f} "
+              f"--chord-back {chord_back:.4f} {sgn}".rstrip())
     return 0
 
 
@@ -606,7 +615,7 @@ def build_parser() -> argparse.ArgumentParser:
     pn.add_argument("--turns", type=float, default=10.0)
     pn.add_argument("--clockwise", action="store_true")
     pn.add_argument("--baseline", type=float, default=0.0,
-                    help="axle-centre -> front datum distance |A B| (m); "
+                    help="back -> front centreline distance |B F| (m); "
                          "prompted if omitted")
     pn.add_argument("--constant", action="store_true",
                     help="overshoot probe: hold a flat --angular-speed (no "

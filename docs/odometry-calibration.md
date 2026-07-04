@@ -78,41 +78,43 @@ the free variable here.)
 
 ## Step 2 — Track width (in-place spin)
 
-Isolate rotation. Mark **two** datums on the floor (plumb-bob / down-laser):
+Isolate rotation. Mark **two** centreline datums on the floor (plumb-bob /
+down-laser) — use the chassis ends, so there is no hard-to-find axle centre:
 
-- `A` = the drive-axle centre (the spin centre),
-- `B` = a second centreline point, e.g. the front, a fixed body distance
-  `L = |A B|` ahead of `A`.
+- `B` = a **back** centreline point,
+- `F` = a **front** centreline point, a fixed body distance `L = |B F|`
+  ahead of `B`.
 
-Measure `L` once with a tape.
+Measure `L` (back → front) once with a tape.
 
 ```bash
-./scripts/calibration_drive.py spin --turns 10 --baseline 0.40
+./scripts/calibration_drive.py spin --turns 10 --baseline 0.60
 ```
 
 Resets odom, spins until odom reads 3600°, stops. Instead of reading the
-leftover angle with a protractor, **measure it from a distance**: an
-in-place spin turns about `A`, so the front datum `B` rides a circle of
-radius `L` and the chord between its start and end marks gives the angle:
+leftover angle with a protractor, **measure it from distances**: an
+in-place spin rotates the whole chassis about a centre on the line `B F`,
+so `B` and `F` each ride a circle and their chords **sum** — independent of
+where that centre sits, because the two radii add up to `L`:
 
-$$\theta_\text{leftover} = 2\arcsin\!\left(\frac{|B\,B'|}{2L}\right)$$
+$$\theta_\text{leftover} = 2\arcsin\!\left(\frac{|F\,F'| + |B\,B'|}{2L}\right)$$
 
-Re-mark the front datum as `B'` after the spin, then enter:
+Re-mark both datums as `B'` and `F'` after the spin, then enter:
 
-1. the **full turns** you counted (the mark passing the start; Enter
+1. the **full turns** you counted (a mark passing the start; Enter
    accepts the commanded count),
 2. the baseline `L` (or pass `--baseline`),
-3. the chord `|B → B'|` (tape),
-4. whether the front mark stopped **past** or **short** of the start in
+3. the chords `|F → F'|` and `|B → B'|` (tape),
+4. whether the marks stopped **past** or **short** of the start in
    the spin direction (one glance — fixes the sign).
 
 The tool computes the physical total (`turns × 360° + leftover`) and prints
 the corrected `TRACK_WIDTH_M`. Edit, rebuild, reflash as above.
 
 > Keep the leftover under 180° (stop within half a turn of an integer
-> count) so the chord is unambiguous. Offline equivalent:
+> count) so the chords are unambiguous. Offline equivalent:
 > `calibrate_constants.py spin-marks --odom-deg 3600 --turns 10
-> --baseline 0.40 --chord 0.098 [--short]`.
+> --baseline 0.60 --chord-front 0.060 --chord-back 0.038 [--short]`.
 
 > Prefer a clean integer ground truth instead? Spin until the chassis mark
 > visually lines up after N turns, read odom, and pass the numbers to
@@ -141,7 +143,7 @@ dead-on the start point while rotated several degrees). Reading that yaw
 with a protractor on the floor is awkward, so capture the whole pose from
 **distances**, which a tape reads quickly and precisely.
 
-Mark **two** datums (same as the spin test):
+Mark **two** datums:
 
 1. **Position datum** `A` — the drive-axle centre. Plumb-bob / down-laser
    it and mark the floor.
@@ -205,9 +207,9 @@ If you already have measurements, skip the driver:
 ./scripts/calibrate_constants.py cov --csv closures.csv   # x,y,theta_deg per line
 
 # distance-only variants (no protractor):
-#   spin leftover from the front-datum chord -> TRACK_WIDTH_M
+#   spin leftover from the back+front centreline chords -> TRACK_WIDTH_M
 ./scripts/calibrate_constants.py spin-marks --odom-deg 3600 --turns 10 \
-    --baseline 0.40 --chord 0.098
+    --baseline 0.60 --chord-front 0.060 --chord-back 0.038
 #   one square closure from four floor-mark distances -> x,y,theta row
 ./scripts/calibrate_constants.py closure -L 0.40 \
     --aa 0.21 --ba 0.43 --ab 0.45 --bb 0.19 --side left

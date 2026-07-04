@@ -24,10 +24,11 @@ Usage
     # in-place spin test → track width
     ./calibrate_constants.py track --odom-deg 3600 --physical-deg 3540
 
-    # spin via the front-datum chord (no protractor): 10 turns, L=0.40 m,
-    # chord |B B'| = 0.098 m, mark stopped just past the start
+    # spin via the back+front centreline chords (no protractor, no axle
+    # centre): 10 turns, back->front L=0.60 m, |F F'|=0.060, |B B'|=0.038,
+    # marks stopped just past the start
     ./calibrate_constants.py spin-marks --odom-deg 3600 --turns 10 \
-        --baseline 0.40 --chord 0.098
+        --baseline 0.60 --chord-front 0.060 --chord-back 0.038
 
     # one square closure from four tape distances between floor marks
     ./calibrate_constants.py closure -L 0.40 --aa 0.21 --bb 0.19 \
@@ -53,7 +54,7 @@ from typing import List, Tuple
 # the baseline a correction scales; override with --current if your tree
 # already differs.
 DEFAULT_WHEEL_DIAMETER_M = 0.17068
-DEFAULT_TRACK_WIDTH_M    = 0.52132
+DEFAULT_TRACK_WIDTH_M    = 0.54481
 
 
 def corrected_wheel_diameter(current_m: float,
@@ -197,24 +198,35 @@ def pose_from_marks(baseline_m: float,
     return xa, ya, dtheta, residual
 
 
-def leftover_from_chord(baseline_m: float, chord_m: float,
-                        past: bool = True) -> float:
-    """Spin leftover angle (deg) from the front-datum chord |B B'|.
+def leftover_from_chords(baseline_m: float,
+                         chord_front_m: float, chord_back_m: float,
+                         past: bool = True) -> float:
+    """Spin leftover angle (deg) from the back + front centreline chords.
 
-    An in-place spin turns about the axle centre, so the front datum B
-    (radius L = ``baseline_m`` from the centre) moves along a circle and
-    ``chord = 2 L sin(theta/2)``.  ``past`` is the spin-direction sign: the
-    front mark stopped just PAST the start (True, +) or SHORT of it
+    An in-place spin rotates the rigid chassis by the leftover angle about a
+    centre that lies on the centreline *between* the back datum B and the
+    front datum F.  Each datum sweeps a chord proportional to its radius from
+    that centre; because the two radii sum to the front-to-back baseline
+    ``L = |B F|``, the two chords sum to ``2 L sin(theta/2)`` no matter where
+    the centre sits::
+
+        |F F'| + |B B'| = 2 L sin(theta / 2)
+
+    so the hard-to-locate axle / spin centre never has to be marked — only
+    the two easy chassis-end points.  ``past`` is the spin-direction sign:
+    the marks stopped just PAST the start (True, +) or SHORT of it
     (False, -).  Magnitude only — keep the leftover under 180 deg (stop
-    within half a turn of an integer count) so the chord is unambiguous.
+    within half a turn of an integer count) so the chords are unambiguous.
     """
     L = float(baseline_m)
     if L <= 0:
-        raise ValueError("baseline (|A B|) must be > 0")
-    ratio = chord_m / (2.0 * L)
+        raise ValueError("baseline (|B F| back->front) must be > 0")
+    chord_sum = float(chord_front_m) + float(chord_back_m)
+    ratio = chord_sum / (2.0 * L)
     if ratio > 1.0 + 1e-6:
         raise ValueError(
-            f"chord {chord_m:.4f} m > 2L ({2 * L:.4f} m): check L or the chord")
+            f"chords sum {chord_sum:.4f} m > 2L ({2 * L:.4f} m): "
+            "check L or the chords")
     mag = math.degrees(2.0 * math.asin(min(1.0, max(0.0, ratio))))
     return mag if past else -mag
 
@@ -311,12 +323,16 @@ def _cmd_closure(args: argparse.Namespace) -> int:
 
 
 def _cmd_spin_marks(args: argparse.Namespace) -> int:
-    leftover = leftover_from_chord(args.baseline, args.chord, past=not args.short)
+    leftover = leftover_from_chords(
+        args.baseline, args.chord_front, args.chord_back, past=not args.short)
     physical = args.turns * 360.0 + leftover
+    chord_sum = args.chord_front + args.chord_back
     print("in-place spin test (chord readout):")
     print(f"  full turns counted : {args.turns:g}  ({args.turns * 360.0:.0f} deg)")
-    print(f"  baseline L = |A B| : {args.baseline:.4f} m")
-    print(f"  chord |B B'|       : {args.chord:.4f} m -> leftover "
+    print(f"  baseline L = |B F| : {args.baseline:.4f} m  (back->front)")
+    print(f"  chord |F F'|       : {args.chord_front:.4f} m")
+    print(f"  chord |B B'|       : {args.chord_back:.4f} m")
+    print(f"  chords sum         : {chord_sum:.4f} m -> leftover "
           f"{leftover:+.2f} deg ({'short' if args.short else 'past'})")
     print(f"  physical total     : {physical:.2f} deg")
     print()
@@ -372,17 +388,22 @@ def main(argv: List[str] | None = None) -> int:
 
     psm = sub.add_parser(
         "spin-marks",
-        help="spin leftover from the front-datum chord -> TRACK_WIDTH_M")
+        help="spin leftover from the back+front centreline chords -> "
+             "TRACK_WIDTH_M")
     psm.add_argument("--odom-deg", type=float, required=True, dest="odom_deg",
                      help="total yaw odom reported (deg)")
     psm.add_argument("--turns", type=float, required=True,
                      help="full turns you counted (e.g. 10)")
     psm.add_argument("--baseline", "-L", type=float, required=True,
-                     help="axle-centre -> front datum distance |A B| (m)")
-    psm.add_argument("--chord", type=float, required=True,
-                     help="chord |B B'| between start/end front marks (m)")
+                     help="back -> front centreline distance |B F| (m)")
+    psm.add_argument("--chord-front", type=float, required=True,
+                     dest="chord_front",
+                     help="chord |F F'| between start/end FRONT marks (m)")
+    psm.add_argument("--chord-back", type=float, required=True,
+                     dest="chord_back",
+                     help="chord |B B'| between start/end BACK marks (m)")
     psm.add_argument("--short", action="store_true",
-                     help="front mark stopped SHORT of start (default: past)")
+                     help="marks stopped SHORT of start (default: past)")
     psm.add_argument("--current", type=float, default=DEFAULT_TRACK_WIDTH_M,
                      help=f"current TRACK_WIDTH_M (default "
                           f"{DEFAULT_TRACK_WIDTH_M})")

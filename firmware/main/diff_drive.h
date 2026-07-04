@@ -34,7 +34,7 @@ extern "C" {
 /* ── Robot parameters (set per build) ────────────────────────────── */
 
 #define WHEEL_DIAMETER_M     0.17068f /* meters — ZLLG65ASM250 V3.0 (170 mm) */
-#define TRACK_WIDTH_M        0.52123f /* wheel-to-wheel center, meters */
+#define TRACK_WIDTH_M        0.54481f /* wheel-to-wheel center, meters */
 #define MAX_WHEEL_RPM        143.0f   /* wheel-side cap (≈ 1.27 m/s for 0.17 m
                                        * wheels).  Direct-drive hub motor, so
                                        * this is also the motor RPM — well under
