@@ -4,7 +4,8 @@
  * Lifecycle:
  *   1. Configure USB-CDC transport
  *   2. Wait for micro-ROS agent
- *   3. Create node, publishers, subscriptions; sync session clock
+ *   3. Create node (domain: CONFIG_UROS_DOMAIN_ID; 255 lets the agent
+ *      choose), publishers, subscriptions; sync session clock
  *   4. Spin loop: executor spin + publish odom/status/failsafe/rc_active,
  *      periodic clock re-sync
  *   5. On agent disconnect: destroy entities, go to step 2
@@ -52,6 +53,10 @@
 #include <math.h>
 
 static const char *TAG = "uros_task";
+
+/* DDS domain IDs stop at 232; 255 is the agent-override value. */
+_Static_assert(CONFIG_UROS_DOMAIN_ID <= 232 || CONFIG_UROS_DOMAIN_ID == 255,
+               "CONFIG_UROS_DOMAIN_ID must be 0-232, or 255 for the agent's choice");
 
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
@@ -253,8 +258,30 @@ static void uros_task_fn(void *arg)
         ESP_LOGI(TAG, "Agent connected");
 
         /* ── Init support & node ────────────────────────────────── */
+        /* The domain is requested explicitly: 255 lets the agent choose
+         * it from XRCE_DOMAIN_ID_OVERRIDE (ADR-0012). */
+        rcl_init_options_t init_options = rcl_get_zero_initialized_init_options();
+        rcl_ret_t rc = rcl_init_options_init(&init_options, allocator);
+        if (rc == RCL_RET_OK) {
+            rc = rcl_init_options_set_domain_id(&init_options,
+                                                CONFIG_UROS_DOMAIN_ID);
+        }
+        if (rc != RCL_RET_OK) {
+            ESP_LOGE(TAG, "init options failed: %d", (int)rc);
+            if (rcl_init_options_fini(&init_options) != RCL_RET_OK) {
+                ESP_LOGW(TAG, "init options fini failed");
+            }
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+
         rclc_support_t support;
-        rcl_ret_t rc = rclc_support_init(&support, 0, NULL, &allocator);
+        rc = rclc_support_init_with_options(&support, 0, NULL,
+                                            &init_options, &allocator);
+        /* rcl_init keeps its own copy of the options. */
+        if (rcl_init_options_fini(&init_options) != RCL_RET_OK) {
+            ESP_LOGW(TAG, "init options fini failed");
+        }
         if (rc != RCL_RET_OK) {
             ESP_LOGE(TAG, "rclc_support_init failed: %d", (int)rc);
             vTaskDelay(pdMS_TO_TICKS(2000));

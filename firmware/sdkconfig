@@ -564,6 +564,12 @@ CONFIG_ZLAC_TPDO_EVENT_MS=20
 # end of ZLAC8015D backend
 
 #
+# micro-ROS session
+#
+CONFIG_UROS_DOMAIN_ID=255
+# end of micro-ROS session
+
+#
 # micro-ROS Settings
 #
 CONFIG_MICRO_ROS_ESP_XRCE_DDS_MIDDLEWARE=y

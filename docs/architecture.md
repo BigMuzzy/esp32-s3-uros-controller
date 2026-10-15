@@ -116,6 +116,7 @@ Documented as Architecture Decision Records in [`adr/`](adr/).
 | 0009  | VESC health monitoring & arming    | Accepted            |
 | 0010  | ZLAC8015D CANopen migration        | Accepted            |
 | 0011  | `rc_active` heartbeat for the host mux | Accepted        |
+| 0012  | ROS domain chosen by the agent     | Accepted            |
 
 ## Roadmap
 
@@ -180,6 +181,17 @@ agent (USB-CDC transport). Serial monitor output goes to UART0
 or should be disabled. During development, monitor and micro-ROS
 agent cannot use the same port simultaneously.
 
+### Run the agent by hand
+
+The firmware asks the agent to choose the ROS domain
+([ADR-0012](adr/0012-ros-domain-from-agent.md)). Give the agent the
+domain of the ROS graph it should join; without the variable it uses 0:
+
+```bash
+XRCE_DOMAIN_ID_OVERRIDE=$ROS_DOMAIN_ID \
+  ros2 run micro_ros_agent micro_ros_agent serial --dev /dev/ttyACM0 -b 115200
+```
+
 ### Build, Flash & Monitor (combined)
 
 ```bash
@@ -192,7 +204,8 @@ idf.py -p /dev/ttyACM0 flash monitor
 idf.py menuconfig
 ```
 
-Relevant settings under `micro-ROS Settings` and `Component config → TWAI`.
+Relevant settings under `micro-ROS Settings`, `micro-ROS session`
+(`UROS_DOMAIN_ID`) and `Component config → TWAI`.
 
 ## Source Layout
 

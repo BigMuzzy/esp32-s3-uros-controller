@@ -166,3 +166,25 @@ config TUNE_WIFI_PORT
     depends on TUNE_WIFI_ENABLE
 
 endmenu
+
+menu "micro-ROS session"
+
+config UROS_DOMAIN_ID
+    int "ROS domain ID (255 = the agent's XRCE_DOMAIN_ID_OVERRIDE)"
+    range 0 255
+    default 255
+    help
+        Domain ID requested when the micro-ROS session starts.
+
+        255 is reserved by Micro XRCE-DDS: the agent replaces it with
+        its XRCE_DOMAIN_ID_OVERRIDE environment variable, so the robot
+        computer chooses the domain at runtime and changing it needs no
+        reflash (ADR-0012).  The host launch sets the variable from
+        ROS_DOMAIN_ID.  Needs Micro XRCE-DDS Agent v2.4.1 or newer; an
+        older agent cannot create domain 255 and the session never
+        starts.
+
+        0-232 pins the domain in the firmware instead, for a bench
+        agent that does not set the override.
+
+endmenu
