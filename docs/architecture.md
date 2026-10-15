@@ -127,7 +127,12 @@ fusion, battery telemetry, VESC fault decode, …) is tracked in
 
 ### Prerequisites
 
-- **ESP-IDF v5.4** — [installation guide](https://docs.espressif.com/projects/esp-idf/en/v5.4/esp32s3/get-started/)
+- **ESP-IDF v5.4.x release tag** (v5.4.4 tested) — [installation guide](https://docs.espressif.com/projects/esp-idf/en/v5.4/esp32s3/get-started/).
+  Do not build from an ESP-IDF `master` snapshot. Pre-release `v5.4-dev`
+  builds have a `usb_serial_jtag` bug that sends about 30,000 zero-length
+  USB packets per second to the host and costs it about 10% CPU (fixed
+  upstream in `7982ece4af`). The official image pins the version:
+  `docker run --rm -v $PWD:/project -w /project espressif/idf:v5.4.4 idf.py build`
 - **Python packages** for micro-ROS build:
   ```bash
   pip install catkin_pkg lark empy==3.3.4
