@@ -5,7 +5,7 @@
  *   1. Configure USB-CDC transport
  *   2. Wait for micro-ROS agent
  *   3. Create node, publishers, subscriptions; sync session clock
- *   4. Spin loop: executor spin + publish odom/status/failsafe,
+ *   4. Spin loop: executor spin + publish odom/status/failsafe/rc_active,
  *      periodic clock re-sync
  *   5. On agent disconnect: destroy entities, go to step 2
  *
@@ -78,6 +78,7 @@ static void yaw_to_quaternion(float yaw,
 static geometry_msgs__msg__Twist  s_cmd_vel_msg;
 static nav_msgs__msg__Odometry    s_odom_msg;
 static std_msgs__msg__Bool        s_failsafe_msg;
+static std_msgs__msg__Bool        s_rc_active_msg;
 static std_srvs__srv__Trigger_Request  s_reset_req;
 static std_srvs__srv__Trigger_Response s_reset_res;
 #ifdef CONFIG_MOTOR_DRIVER_VESC
@@ -196,6 +197,18 @@ static void publish_failsafe(rcl_publisher_t *pub)
     rcl_publish(pub, &s_failsafe_msg, NULL);
 }
 
+/* rc_active (ADR-0011): true exactly while the RC mode switch has the
+ * robot in DRIVE_MODE_MANUAL.  The host uses it as a twist_mux lock, so
+ * RC masks every ROS velocity input.  It is NOT failsafe/active, which is
+ * also true in DRIVE_MODE_FAILSAFE_STOP (stale cmd_vel): as a lock that
+ * would block the very commands that end the failsafe.  Published every
+ * loop as a heartbeat; the host lock times out and blocks if it stops. */
+static void publish_rc_active(rcl_publisher_t *pub)
+{
+    s_rc_active_msg.data = (rc_failsafe_get_mode() == DRIVE_MODE_MANUAL);
+    rcl_publish(pub, &s_rc_active_msg, NULL);
+}
+
 /* Per-VESC health → sensor_msgs/BatteryState.
  * VESC-specific path: queries motor_driver_vesc directly for the per-
  * controller voltage.  Backend-agnostic battery publishing (using
@@ -289,6 +302,14 @@ static void uros_task_fn(void *arg)
         bool failsafe_ok = (rc == RCL_RET_OK);
         if (!failsafe_ok) {
             ESP_LOGE(TAG, "failsafe publisher init failed: %d", (int)rc);
+        }
+
+        rcl_publisher_t rc_active_pub;
+        rc = rclc_publisher_init_default(&rc_active_pub, &node,
+            ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Bool), "rc_active");
+        bool rc_active_ok = (rc == RCL_RET_OK);
+        if (!rc_active_ok) {
+            ESP_LOGE(TAG, "rc_active publisher init failed: %d", (int)rc);
         }
 
 #ifdef CONFIG_MOTOR_DRIVER_VESC
@@ -438,6 +459,7 @@ static void uros_task_fn(void *arg)
 
             if (odom_ok)     publish_odom(&odom_pub);
             if (failsafe_ok) publish_failsafe(&failsafe_pub);
+            if (rc_active_ok) publish_rc_active(&rc_active_pub);
 #ifdef CONFIG_MOTOR_DRIVER_VESC
             if (battery_ok[0]) publish_battery(&battery_pub[0], VESC_ID_LEFT,  0);
             if (battery_ok[1]) publish_battery(&battery_pub[1], VESC_ID_RIGHT, 1);
@@ -454,6 +476,7 @@ static void uros_task_fn(void *arg)
         if (battery_ok[1]) rcl_publisher_fini(&battery_pub[1], &node);
         if (battery_ok[0]) rcl_publisher_fini(&battery_pub[0], &node);
 #endif
+        if (rc_active_ok) rcl_publisher_fini(&rc_active_pub, &node);
         if (failsafe_ok) rcl_publisher_fini(&failsafe_pub, &node);
         if (odom_ok)     rcl_publisher_fini(&odom_pub, &node);
         rcl_node_fini(&node);

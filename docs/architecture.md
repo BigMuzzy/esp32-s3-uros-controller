@@ -96,6 +96,7 @@ the PWM edges and `motor_task` polls them each 20 ms tick.
 | Pub       | `odom`                    | `nav_msgs/Odometry`     | Wheel odometry             |
 | Pub       | `motor/status`            | TBD                     | Motor telemetry (V, A, T)  |
 | Pub       | `failsafe/active`         | `std_msgs/Bool`         | Failsafe state             |
+| Pub       | `rc_active`               | `std_msgs/Bool`         | `true` only in RC manual mode; host mux lock ([ADR-0011](adr/0011-rc-active-heartbeat.md)) |
 | Srv       | `reset_odom`              | `std_srvs/Trigger`      | Zero odom pose (no reboot) |
 
 ## Key Design Decisions
@@ -114,6 +115,7 @@ Documented as Architecture Decision Records in [`adr/`](adr/).
 | 0008  | Debug console on SH1.0 UART        | Accepted            |
 | 0009  | VESC health monitoring & arming    | Accepted            |
 | 0010  | ZLAC8015D CANopen migration        | Accepted            |
+| 0011  | `rc_active` heartbeat for the host mux | Accepted        |
 
 ## Roadmap
 
