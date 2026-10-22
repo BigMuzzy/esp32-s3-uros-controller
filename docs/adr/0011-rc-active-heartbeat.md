@@ -1,6 +1,6 @@
 # ADR-0011: `rc_active` Heartbeat for the Host Velocity Mux
 
-**Status:** Accepted
+**Status:** Accepted (amended 2026-10-21: no delivery wait, proposed)
 **Date:** 2026-09-26
 **Related:** ADR-0006 (RC failsafe & mixing); host repository ADR-0005
 (velocity arbitration with `twist_mux`)
@@ -43,3 +43,28 @@ nominally 10 ms, when the loop is not blocked on transport):
   ZLAC build uses 3).
 - Manual-mode motor control is unchanged: RC still drives the motors
   directly (ADR-0006). The heartbeat only tells the host to stand down.
+
+## Amendment (2026-10-21): publish without waiting for delivery
+
+**Context.** A reliable `rcl_publish` blocks until the agent confirms
+delivery, one USB round trip per message, and the spin loop has no timer:
+its period is the executor wait plus one round trip per reliable publish.
+Adding `rc_active` as a third blocking publish cut `odom` on Lunokhod-1 from
+61 Hz (2026-10-05/06) to 42 Hz (2026-10-20/21). The ESP32's own stamps show
+the loop stalling for 0.1-0.6 s when the robot computer answers late.
+
+**Decision.** `rc_active` and `failsafe/active` are published without
+waiting for the confirmation (`rmw_uros_set_publisher_session_timeout`
+set to 0). Both stay reliable: the host's subscriptions, including the
+`twist_mux` lock, still match, and lost frames are retransmitted.
+The `odom` publish still waits, and its wait covers everything sent before
+it on the session's reliable stream. The heartbeat is still sent every loop.
+
+**Consequences.**
+
+- One blocking round trip per loop instead of three.
+- `rcl_publish` reports an error for these two topics while their
+  confirmation is outstanding. The loop ignores publish results.
+- If the stream is full (the agent has not answered for a long time), a
+  heartbeat frame is dropped instead of stalling the loop. The host lock's
+  0.5 s timeout still masks the inputs if heartbeats stop.

@@ -214,6 +214,24 @@ static void publish_rc_active(rcl_publisher_t *pub)
     rcl_publish(pub, &s_rc_active_msg, NULL);
 }
 
+/* A reliable rcl_publish blocks until the agent confirms delivery: one
+ * USB round trip per message.  Three of those per loop held /odom at
+ * 42 Hz on Lunokhod-1, against 61 Hz with two (ADR-0011 amendment).
+ * The small status topics therefore send without waiting (timeout 0:
+ * at most about 1 ms of polling).  They stay reliable, so host
+ * subscribers still match and lost frames are retransmitted, and the
+ * odom publish of the next loop waits until the whole reliable stream,
+ * these included, is confirmed.  rcl_publish then reports an error
+ * while the confirmation is outstanding; the loop ignores the result. */
+static void skip_delivery_wait(rcl_publisher_t *pub, const char *name)
+{
+    rmw_publisher_t *rmw_pub = rcl_publisher_get_rmw_handle(pub);
+    if (rmw_pub == NULL ||
+        rmw_uros_set_publisher_session_timeout(rmw_pub, 0) != RMW_RET_OK) {
+        ESP_LOGW(TAG, "%s: publishing with delivery wait", name);
+    }
+}
+
 /* Per-VESC health → sensor_msgs/BatteryState.
  * VESC-specific path: queries motor_driver_vesc directly for the per-
  * controller voltage.  Backend-agnostic battery publishing (using
@@ -338,6 +356,9 @@ static void uros_task_fn(void *arg)
         if (!rc_active_ok) {
             ESP_LOGE(TAG, "rc_active publisher init failed: %d", (int)rc);
         }
+
+        if (failsafe_ok)  skip_delivery_wait(&failsafe_pub, "failsafe/active");
+        if (rc_active_ok) skip_delivery_wait(&rc_active_pub, "rc_active");
 
 #ifdef CONFIG_MOTOR_DRIVER_VESC
         rcl_publisher_t battery_pub[2];
