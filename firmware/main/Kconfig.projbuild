@@ -106,15 +106,28 @@ config ZLAC_INVERT_RIGHT
 config ZLAC_PROFILE_ACCEL_MS
     int "S-curve acceleration time (ms, object 0x6083)"
     range 0 32767
-    default 500
+    default 250
     help
         Time to accelerate from 0 to target speed.  Vendor unit
         is milliseconds (NOT RPM/s).
 
+        The drive restarts this S-curve from the wheel's current
+        speed on every new target, and targets change every 20 ms
+        while the host ramps a turn.  A long time therefore makes
+        big, ramped turn swings arrive late: on Lunokhod-1 500 ms
+        gave about 1.2 s of turn lag and a path-tracking weave;
+        250 ms gives about 0.4 s at the same peak current
+        (unloaded stand test 2026-10-23).  Shorter is faster but
+        draws more current (100 ms: about 1.7x on the stands).
+
 config ZLAC_PROFILE_DECEL_MS
     int "S-curve deceleration time (ms, object 0x6084)"
     range 0 32767
-    default 500
+    default 250
+    help
+        Time to decelerate from target speed to 0; restarted on
+        every new target like the acceleration time.  Shorter
+        stops are quicker and harder.
 
 config ZLAC_HEARTBEAT_INTERVAL_MS
     int "Producer heartbeat interval (ms, object 0x1017)"
