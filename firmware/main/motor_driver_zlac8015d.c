@@ -91,6 +91,7 @@
 #define OD_MODES_OF_OPERATION   0x6060  /* i8,  shared                     */
 #define OD_POSITION_ACTUAL      0x6064  /* i32, sub1=L sub2=R              */
 #define OD_VELOCITY_ACTUAL      0x606C  /* i32, sub1=L sub2=R (0.1 RPM)    */
+#define OD_TORQUE_ACTUAL        0x6077  /* i16, sub1=L sub2=R (0.1 A)      */
 #define OD_ACCEL_TIME           0x6083  /* u32, sub1=L sub2=R (ms)         */
 #define OD_DECEL_TIME           0x6084  /* u32, sub1=L sub2=R (ms)         */
 #define OD_TARGET_VELOCITY      0x60FF  /* i32, sub1=L sub2=R (RPM)        */
@@ -133,6 +134,7 @@ typedef struct {
     bool             invert;
     int32_t          target_motor_rpm;   /* setpoint after sign/clamp (motor RPM) */
     float            actual_motor_rpm;   /* feedback (motor RPM, 0.1 resolution)  */
+    float            current_a;          /* 0x6077 feedback (A), NAN if unmapped  */
     int32_t          position_counts;
     uint16_t         statusword;
     cia402_state_t   state;
@@ -160,6 +162,33 @@ static axis_state_t      s_axes[NUM_AXES];
 /* Heartbeat snapshot maintained by tx_task */
 static uint32_t            s_last_heartbeat_ms;
 static bool                s_heartbeat_seen;
+
+/* Telemetry times (esp_timer us, 0 = never) */
+static int64_t           s_last_rpdo_us;
+static int64_t           s_last_velocity_us;
+static int64_t           s_last_current_us;
+/* Targets carried by the last RPDO1 that was queued successfully. */
+static int32_t           s_sent_target_motor_rpm[2];
+static uint32_t          s_rpdo_errors;
+
+/* TPDO3 (0x6077 current) entry width in bits; 0 = not mapped. */
+static uint8_t           s_current_bits;
+
+/* S-curve profile times: requested (applied at bring-up and on request)
+ * and as read back from the drive. */
+static uint32_t          s_profile_accel_ms = ZLAC_ACCEL_MS;
+static uint32_t          s_profile_decel_ms = ZLAC_DECEL_MS;
+static bool              s_profile_pending;
+static uint32_t          s_profile_gen;      /* bumped by every request */
+static uint32_t          s_applied_accel_ms = UINT32_MAX;
+static uint32_t          s_applied_decel_ms = UINT32_MAX;
+/* Last profile both axes confirmed; restored if a runtime change fails. */
+static uint32_t          s_confirmed_accel_ms = ZLAC_ACCEL_MS;
+static uint32_t          s_confirmed_decel_ms = ZLAC_DECEL_MS;
+static uint32_t          s_profile_errors;
+
+/* Per-SDO timeout for runtime profile changes; bounds the RPDO pause. */
+#define ZLAC_PROFILE_SDO_TIMEOUT_MS 50U
 
 /* ---- utility ---------------------------------------------------------- */
 
@@ -241,13 +270,44 @@ static void on_tpdo_velocities(uint32_t cob_id, const uint8_t *data,
      * float instead of truncating to integer motor RPM. */
     float vel_l = (float)vel_l_decirpm / 10.0f;
     float vel_r = (float)vel_r_decirpm / 10.0f;
-    uint32_t t = now_ms();
+    int64_t t_us = esp_timer_get_time();
+    uint32_t t = (uint32_t)(t_us / 1000);
 
     xSemaphoreTake(s_lock, portMAX_DELAY);
     s_axes[AXIS_LEFT].actual_motor_rpm  = s_axes[AXIS_LEFT].invert  ? -vel_l : vel_l;
     s_axes[AXIS_RIGHT].actual_motor_rpm = s_axes[AXIS_RIGHT].invert ? -vel_r : vel_r;
     s_axes[AXIS_LEFT].last_tpdo_ms      = t;
     s_axes[AXIS_RIGHT].last_tpdo_ms     = t;
+    s_last_velocity_us                  = t_us;
+    xSemaphoreGive(s_lock);
+}
+
+static void on_tpdo_currents(uint32_t cob_id, const uint8_t *data,
+                             uint8_t dlc, void *ctx)
+{
+    (void)cob_id; (void)ctx;
+    float cur_l, cur_r;
+    if (s_current_bits == 16 && dlc >= 4) {
+        int16_t l, r;
+        memcpy(&l, &data[0], 2);
+        memcpy(&r, &data[2], 2);
+        cur_l = (float)l / 10.0f;
+        cur_r = (float)r / 10.0f;
+    } else if (s_current_bits == 32 && dlc >= 8) {
+        int32_t l, r;
+        memcpy(&l, &data[0], 4);
+        memcpy(&r, &data[4], 4);
+        cur_l = (float)l / 10.0f;
+        cur_r = (float)r / 10.0f;
+    } else {
+        return;
+    }
+    int64_t t_us = esp_timer_get_time();
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_axes[AXIS_LEFT].current_a  = s_axes[AXIS_LEFT].invert  ? -cur_l : cur_l;
+    s_axes[AXIS_RIGHT].current_a = s_axes[AXIS_RIGHT].invert ? -cur_r : cur_r;
+    s_last_current_us            = t_us;
     xSemaphoreGive(s_lock);
 }
 
@@ -316,6 +376,49 @@ static bool configure_tpdo(uint8_t pdo_idx,
     if (!sdo_w16(comm, 5, event_timer_halfms))return false;
     if (!sdo_w32(comm, 1, cob))               return false;
     return true;
+}
+
+/* Write the S-curve accel/decel times (0x6083/0x6084) to both axes and read
+ * all four back.  Returns whether every write succeeded; *symmetric tells
+ * whether both axes read back the same accel and the same decel time (the
+ * drive may clamp a value, so it is not compared with the request).
+ * Telemetry reports the read-back, or UINT32_MAX when the axes differ or a
+ * read fails.  timeout_ms bounds each SDO (0 = the module default). */
+static bool write_profile(uint32_t accel_ms, uint32_t decel_ms,
+                          uint32_t timeout_ms, bool *symmetric)
+{
+    bool wrote = true;
+    for (uint8_t sub = 1; sub <= 2 && wrote; ++sub) {
+        wrote = canopen_sdo_write_u32(ZLAC_NODE, OD_ACCEL_TIME, sub,
+                                      accel_ms, timeout_ms) == ESP_OK &&
+                canopen_sdo_write_u32(ZLAC_NODE, OD_DECEL_TIME, sub,
+                                      decel_ms, timeout_ms) == ESP_OK;
+    }
+    uint32_t ra[2] = {UINT32_MAX, UINT32_MAX};
+    uint32_t rd[2] = {UINT32_MAX, UINT32_MAX};
+    for (uint8_t sub = 1; sub <= 2; ++sub) {
+        if (canopen_sdo_read_u32(ZLAC_NODE, OD_ACCEL_TIME, sub,
+                                 &ra[sub - 1], timeout_ms) != ESP_OK) {
+            ra[sub - 1] = UINT32_MAX;
+        }
+        if (canopen_sdo_read_u32(ZLAC_NODE, OD_DECEL_TIME, sub,
+                                 &rd[sub - 1], timeout_ms) != ESP_OK) {
+            rd[sub - 1] = UINT32_MAX;
+        }
+    }
+    bool sym = ra[0] == ra[1] && rd[0] == rd[1] &&
+               ra[0] != UINT32_MAX && rd[0] != UINT32_MAX;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_applied_accel_ms = sym ? ra[0] : UINT32_MAX;
+    s_applied_decel_ms = sym ? rd[0] : UINT32_MAX;
+    xSemaphoreGive(s_lock);
+    ESP_LOGI(TAG, "profile 0x6083/0x6084 write %" PRIu32 "/%" PRIu32
+                  " ms %s; read back L %" PRIu32 "/%" PRIu32
+                  " R %" PRIu32 "/%" PRIu32 " ms",
+             accel_ms, decel_ms, wrote ? "ok" : "FAILED",
+             ra[0], rd[0], ra[1], rd[1]);
+    if (symmetric) *symmetric = sym;
+    return wrote;
 }
 
 /* Time to wait for the drive to answer SDOs after an NMT reset.  The
@@ -417,13 +520,26 @@ static bool bring_up_sequence(void)
         }
     }
 
-    /* Accel / decel times (ms) — set both channels */
-    if (!sdo_w32(OD_ACCEL_TIME, 1, ZLAC_ACCEL_MS) ||
-        !sdo_w32(OD_ACCEL_TIME, 2, ZLAC_ACCEL_MS) ||
-        !sdo_w32(OD_DECEL_TIME, 1, ZLAC_DECEL_MS) ||
-        !sdo_w32(OD_DECEL_TIME, 2, ZLAC_DECEL_MS)) {
-        ESP_LOGE(TAG, "set 0x6083/0x6084 failed");
-        return false;
+    /* Accel / decel times (ms) — set both channels.  The requested value
+     * starts at the Kconfig default and follows runtime requests, so a
+     * re-connection keeps the last requested profile. */
+    {
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        uint32_t accel_ms = s_profile_accel_ms;
+        uint32_t decel_ms = s_profile_decel_ms;
+        s_profile_pending = false;
+        xSemaphoreGive(s_lock);
+        bool sym = false;
+        if (!write_profile(accel_ms, decel_ms, 0, &sym)) {
+            ESP_LOGE(TAG, "set 0x6083/0x6084 failed");
+            return false;
+        }
+        if (sym) {
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            s_confirmed_accel_ms = accel_ms;
+            s_confirmed_decel_ms = decel_ms;
+            xSemaphoreGive(s_lock);
+        }
     }
 
     /* Zero initial targets */
@@ -478,11 +594,42 @@ static bool bring_up_sequence(void)
             return false;
         }
     }
+    /* TPDO3 — phase current L/R (0x6077, 0.1 A).  Telemetry only, so a
+     * drive that refuses the mapping is not a bring-up failure.  The
+     * object is documented as 16-bit; 32-bit is tried as a fallback. */
+    {
+        const uint32_t map16[2] = {
+            PDO_MAP_ENTRY(OD_TORQUE_ACTUAL, 1, 16),
+            PDO_MAP_ENTRY(OD_TORQUE_ACTUAL, 2, 16),
+        };
+        const uint32_t map32[2] = {
+            PDO_MAP_ENTRY(OD_TORQUE_ACTUAL, 1, 32),
+            PDO_MAP_ENTRY(OD_TORQUE_ACTUAL, 2, 32),
+        };
+        s_current_bits = 0;
+        if (configure_tpdo(3, map16, 2, event_timer_halfms)) {
+            s_current_bits = 16;
+        } else if (configure_tpdo(3, map32, 2, event_timer_halfms)) {
+            s_current_bits = 32;
+        }
+        if (s_current_bits) {
+            ESP_LOGI(TAG, "TPDO3 maps 0x6077 current (%u-bit)",
+                     (unsigned)s_current_bits);
+        } else {
+            ESP_LOGW(TAG, "TPDO3 (0x6077 current) not mapped; "
+                          "current telemetry off");
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            s_axes[AXIS_LEFT].current_a  = NAN;
+            s_axes[AXIS_RIGHT].current_a = NAN;
+            xSemaphoreGive(s_lock);
+        }
+    }
 
     /* Register RX hooks on the per-PDO COB-IDs */
     canopen_register_pdo_cb(0x180 + ZLAC_NODE, on_tpdo_statusword,  NULL);
     canopen_register_pdo_cb(0x280 + ZLAC_NODE, on_tpdo_positions,   NULL);
     canopen_register_pdo_cb(0x380 + ZLAC_NODE, on_tpdo_velocities,  NULL);
+    canopen_register_pdo_cb(0x480 + ZLAC_NODE, on_tpdo_currents,    NULL);
 
     /* Enter operational */
     ESP_LOGI(TAG, "NMT start node %u", (unsigned)ZLAC_NODE);
@@ -635,6 +782,58 @@ static void tx_task(void *arg)
             continue;
         }
 
+        /* A runtime profile change (bench) is applied only while both
+         * wheels are commanded, and were last sent, zero: its SDOs pause
+         * this task's RPDO transmission for up to ~0.4 s.  If the axes do
+         * not read back equal, the last confirmed profile is restored. */
+        xSemaphoreTake(s_lock, portMAX_DELAY);
+        bool at_rest = s_cmd.left_rpm == 0.0f && s_cmd.right_rpm == 0.0f &&
+                       s_sent_target_motor_rpm[AXIS_LEFT] == 0 &&
+                       s_sent_target_motor_rpm[AXIS_RIGHT] == 0;
+        bool     profile_apply = s_profile_pending && at_rest;
+        uint32_t profile_accel = s_profile_accel_ms;
+        uint32_t profile_decel = s_profile_decel_ms;
+        uint32_t profile_gen   = s_profile_gen;
+        uint32_t keep_accel    = s_confirmed_accel_ms;
+        uint32_t keep_decel    = s_confirmed_decel_ms;
+        if (profile_apply) s_profile_pending = false;
+        xSemaphoreGive(s_lock);
+        if (profile_apply) {
+            bool sym = false;
+            bool ok = write_profile(profile_accel, profile_decel,
+                                    ZLAC_PROFILE_SDO_TIMEOUT_MS, &sym);
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            if (ok && sym) {
+                s_confirmed_accel_ms = profile_accel;
+                s_confirmed_decel_ms = profile_decel;
+            } else {
+                s_profile_errors++;
+                if (s_profile_gen == profile_gen) {
+                    s_profile_accel_ms = keep_accel;
+                    s_profile_decel_ms = keep_decel;
+                }
+            }
+            xSemaphoreGive(s_lock);
+            if (!(ok && sym)) {
+                ESP_LOGW(TAG, "profile change failed; restoring %" PRIu32
+                              "/%" PRIu32 " ms", keep_accel, keep_decel);
+                bool rsym = false;
+                bool rok = write_profile(keep_accel, keep_decel,
+                                         ZLAC_PROFILE_SDO_TIMEOUT_MS, &rsym);
+                if (!(rok && rsym)) {
+                    /* The axes may now differ: drop the link so the drive
+                     * disarms and a full bring-up rewrites the profile
+                     * before it can arm again. */
+                    ESP_LOGE(TAG, "profile restore failed; re-running bring-up");
+                    xSemaphoreTake(s_lock, portMAX_DELAY);
+                    s_boot_passed = false;
+                    xSemaphoreGive(s_lock);
+                    vTaskDelay(pdMS_TO_TICKS(ZLAC_TX_TICK_MS));
+                    continue;
+                }
+            }
+        }
+
         xSemaphoreTake(s_lock, portMAX_DELAY);
 
         /* Translate wheel-side cmd_vel into motor RPM per axis. */
@@ -683,7 +882,18 @@ static void tx_task(void *arg)
         uint8_t v_frame[8];
         memcpy(&v_frame[0], &bus_l, 4);
         memcpy(&v_frame[4], &bus_r, 4);
-        canopen_send_pdo(0x300 + ZLAC_NODE, v_frame, 8);
+        if (canopen_send_pdo(0x300 + ZLAC_NODE, v_frame, 8) == ESP_OK) {
+            int64_t sent_us = esp_timer_get_time();
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            s_last_rpdo_us = sent_us;
+            s_sent_target_motor_rpm[AXIS_LEFT]  = tgt_l;
+            s_sent_target_motor_rpm[AXIS_RIGHT] = tgt_r;
+            xSemaphoreGive(s_lock);
+        } else {
+            xSemaphoreTake(s_lock, portMAX_DELAY);
+            s_rpdo_errors++;
+            xSemaphoreGive(s_lock);
+        }
 
         vTaskDelay(pdMS_TO_TICKS(ZLAC_TX_TICK_MS));
     }
@@ -698,6 +908,8 @@ esp_err_t motor_driver_init(void)
     if (!s_lock) return ESP_ERR_NO_MEM;
 
     memset(s_axes, 0, sizeof(s_axes));
+    s_axes[AXIS_LEFT].current_a  = NAN;
+    s_axes[AXIS_RIGHT].current_a = NAN;
 #ifdef CONFIG_ZLAC_INVERT_LEFT
     s_axes[AXIS_LEFT].invert  = true;
 #endif
@@ -805,6 +1017,8 @@ bool motor_driver_get_feedback(motor_feedback_t *fb_out)
     float   mrpm_r = s_axes[AXIS_RIGHT].actual_motor_rpm;
     int32_t cnts_l = s_axes[AXIS_LEFT].position_counts;
     int32_t cnts_r = s_axes[AXIS_RIGHT].position_counts;
+    float   cur_l  = s_axes[AXIS_LEFT].current_a;
+    float   cur_r  = s_axes[AXIS_RIGHT].current_a;
     uint16_t sw_l  = s_axes[AXIS_LEFT].statusword;
     uint16_t sw_r  = s_axes[AXIS_RIGHT].statusword;
     uint32_t t_l   = s_axes[AXIS_LEFT].last_tpdo_ms;
@@ -814,12 +1028,12 @@ bool motor_driver_get_feedback(motor_feedback_t *fb_out)
     int32_t cpwr = counts_per_wheel_rev();
     fb_out->left.rpm           = motor_rpm_to_wheel_rpm(mrpm_l);
     fb_out->left.revolutions   = (float)((double)cnts_l / (double)cpwr);
-    fb_out->left.current_a     = 0.0f;
+    fb_out->left.current_a     = isnan(cur_l) ? 0.0f : cur_l;
     fb_out->left.fault_code_raw= sw_l;
     fb_out->left.fault_bits    = map_fault_bits(sw_l);
     fb_out->right.rpm          = motor_rpm_to_wheel_rpm(mrpm_r);
     fb_out->right.revolutions  = (float)((double)cnts_r / (double)cpwr);
-    fb_out->right.current_a    = 0.0f;
+    fb_out->right.current_a    = isnan(cur_r) ? 0.0f : cur_r;
     fb_out->right.fault_code_raw= sw_r;
     fb_out->right.fault_bits   = map_fault_bits(sw_r);
     fb_out->bus_voltage_v      = 0.0f;  /* 0x2035 not in PDO map */
@@ -869,4 +1083,59 @@ bool motor_driver_zlac_get_axis_status(int axis, zlac_axis_status_t *out)
     out->position_counts   = s_axes[axis].position_counts;
     xSemaphoreGive(s_lock);
     return true;
+}
+
+bool motor_driver_zlac_get_telemetry(zlac_telemetry_t *out)
+{
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    out->current_a[0] = NAN;
+    out->current_a[1] = NAN;
+    if (!s_initialised) return false;
+
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    uint32_t t = now_ms();
+    out->rpdo_us     = s_last_rpdo_us;
+    out->velocity_us = s_last_velocity_us;
+    out->current_us  = s_last_current_us;
+    for (int i = 0; i < NUM_AXES; ++i) {
+        out->target_wheel_rpm[i] =
+            motor_rpm_to_wheel_rpm((float)s_sent_target_motor_rpm[i]);
+        out->actual_wheel_rpm[i] =
+            motor_rpm_to_wheel_rpm(s_axes[i].actual_motor_rpm);
+        out->current_a[i]  = s_axes[i].current_a;
+        out->statusword[i] = s_axes[i].statusword;
+    }
+    out->boot_passed     = s_boot_passed;
+    out->heartbeat_fresh = s_heartbeat_seen &&
+                           (t - s_last_heartbeat_ms) < ZLAC_HEARTBEAT_TIMEOUT;
+    out->tpdo_fresh      = s_axes[AXIS_LEFT].tpdo_seen && s_axes[AXIS_RIGHT].tpdo_seen &&
+                           (t - s_axes[AXIS_LEFT].last_tpdo_ms)  < ZLAC_TPDO_TIMEOUT &&
+                           (t - s_axes[AXIS_RIGHT].last_tpdo_ms) < ZLAC_TPDO_TIMEOUT;
+    out->operation_enabled =
+        s_axes[AXIS_LEFT].state  == CIA402_STATE_OPERATION_ENABLED &&
+        s_axes[AXIS_RIGHT].state == CIA402_STATE_OPERATION_ENABLED;
+    out->estop           = s_estop;
+    out->fault           = map_fault_bits(s_axes[AXIS_LEFT].statusword) ||
+                           map_fault_bits(s_axes[AXIS_RIGHT].statusword);
+    out->heartbeat_age_ms = s_heartbeat_seen ? (t - s_last_heartbeat_ms) : UINT32_MAX;
+    out->accel_ms        = s_applied_accel_ms;
+    out->decel_ms        = s_applied_decel_ms;
+    out->profile_errors  = s_profile_errors;
+    out->rpdo_errors     = s_rpdo_errors;
+    xSemaphoreGive(s_lock);
+    return true;
+}
+
+void motor_driver_zlac_request_profile_ms(uint32_t accel_ms, uint32_t decel_ms)
+{
+    if (!s_initialised) return;
+    if (accel_ms > 32767) accel_ms = 32767;
+    if (decel_ms > 32767) decel_ms = 32767;
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    s_profile_accel_ms = accel_ms;
+    s_profile_decel_ms = decel_ms;
+    s_profile_pending  = true;
+    s_profile_gen++;
+    xSemaphoreGive(s_lock);
 }

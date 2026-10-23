@@ -135,6 +135,19 @@ config ZLAC_TPDO_EVENT_MS
         transmission type 0xFF).  Underlying register unit is
         0.5 ms; firmware converts.
 
+config ZLAC_RUNTIME_PROFILE
+    bool "Accept chassis/profile_ms to change 0x6083/0x6084 at runtime (bench)"
+    default n
+    help
+        Subscribe to chassis/profile_ms (std_msgs/Int32, milliseconds)
+        and write the value to the S-curve acceleration and
+        deceleration times of both axes by SDO, once both wheels are
+        commanded zero; if the axes do not read back equal, the last
+        confirmed times are restored.  The value holds until the
+        controller reboots, then the Kconfig times above apply again.
+        Any node on the ROS graph can change the drive's response with
+        it, so enable it for bench measurements only.
+
 endmenu
 
 menu "Tuning CLI (VESC PID)"
@@ -186,5 +199,16 @@ config UROS_DOMAIN_ID
 
         0-232 pins the domain in the firmware instead, for a bench
         agent that does not set the override.
+
+config UROS_CHASSIS_TELEMETRY
+    bool "Publish chassis/telemetry (command path and drive readiness)"
+    default y
+    depends on MOTOR_DRIVER_ZLAC8015D
+    help
+        Best-effort std_msgs/Float64MultiArray on chassis/telemetry,
+        once per spin loop (about 50 Hz): /cmd_vel receipt, the wheel
+        targets sent to the drive, measured wheel speed and current,
+        and the drive's readiness, each stamped on the ESP32.  The
+        layout is documented in uros_task.h.
 
 endmenu

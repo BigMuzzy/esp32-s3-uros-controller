@@ -24,8 +24,12 @@
 #include "uros_transport_usb_jtag.h"
 #include "sdkconfig.h"
 #include "motor_task.h"
+#include "motor_driver.h"
 #ifdef CONFIG_MOTOR_DRIVER_VESC
 #include "motor_driver_vesc.h"   /* VESC-backend-specific battery health */
+#endif
+#ifdef CONFIG_MOTOR_DRIVER_ZLAC8015D
+#include "motor_driver_zlac8015d.h"   /* telemetry + runtime profile */
 #endif
 #include "rc_failsafe.h"
 #include "diff_drive.h"
@@ -44,6 +48,8 @@
 #include <nav_msgs/msg/odometry.h>
 #include <sensor_msgs/msg/battery_state.h>
 #include <std_msgs/msg/bool.h>
+#include <std_msgs/msg/float64_multi_array.h>
+#include <std_msgs/msg/int32.h>
 #include <std_srvs/srv/trigger.h>
 #include <builtin_interfaces/msg/time.h>
 
@@ -89,6 +95,20 @@ static std_srvs__srv__Trigger_Response s_reset_res;
 #ifdef CONFIG_MOTOR_DRIVER_VESC
 static sensor_msgs__msg__BatteryState s_battery_msg[2]; /* [0]=LEFT, [1]=RIGHT */
 #endif
+#ifdef CONFIG_UROS_CHASSIS_TELEMETRY
+static std_msgs__msg__Float64MultiArray s_telem_msg;
+static double s_telem_data[UROS_TELEMETRY_LEN];
+#endif
+#ifdef CONFIG_ZLAC_RUNTIME_PROFILE
+static std_msgs__msg__Int32 s_profile_msg;
+#endif
+
+/* Last cmd_vel receipt, for chassis/telemetry.  Written by cmd_vel_cb and
+ * read by the publisher, both in this task, so no lock is needed. */
+static int64_t  s_cmd_rx_us;
+static uint32_t s_cmd_rx_count;
+static float    s_cmd_rx_lin;
+static float    s_cmd_rx_ang;
 
 /* ── cmd_vel subscription callback ───────────────────────────────── */
 
@@ -96,6 +116,11 @@ static void cmd_vel_cb(const void *msg_in)
 {
     const geometry_msgs__msg__Twist *twist =
         (const geometry_msgs__msg__Twist *)msg_in;
+
+    s_cmd_rx_us = esp_timer_get_time();
+    s_cmd_rx_count++;
+    s_cmd_rx_lin = (float)twist->linear.x;
+    s_cmd_rx_ang = (float)twist->angular.z;
 
     cmd_vel_t cmd = {
         .linear_x  = (float)twist->linear.x,
@@ -125,6 +150,17 @@ static void cmd_vel_cb(const void *msg_in)
 
     motor_task_set_cmd_vel(&cmd);
 }
+
+#ifdef CONFIG_ZLAC_RUNTIME_PROFILE
+/* chassis/profile_ms (bench): S-curve accel = decel time for both axes. */
+static void profile_cb(const void *msg_in)
+{
+    const std_msgs__msg__Int32 *m = (const std_msgs__msg__Int32 *)msg_in;
+    int32_t ms = m->data < 0 ? 0 : m->data;
+    ESP_LOGI(TAG, "chassis/profile_ms: %ld ms requested", (long)ms);
+    motor_driver_zlac_request_profile_ms((uint32_t)ms, (uint32_t)ms);
+}
+#endif
 
 /* ── reset_odom service callback ───────────────────────────── */
 
@@ -213,6 +249,70 @@ static void publish_rc_active(rcl_publisher_t *pub)
     s_rc_active_msg.data = (rc_failsafe_get_mode() == DRIVE_MODE_MANUAL);
     rcl_publish(pub, &s_rc_active_msg, NULL);
 }
+
+#ifdef CONFIG_UROS_CHASSIS_TELEMETRY
+/* esp_timer time (us) -> ROS epoch seconds; NAN for "never" (0). */
+static double epoch_s(int64_t us, int64_t offset_ns)
+{
+    if (us <= 0) return NAN;
+    return (double)(us * 1000 + offset_ns) * 1e-9;
+}
+
+/* chassis/telemetry, layout in uros_task.h. */
+static void publish_telemetry(rcl_publisher_t *pub)
+{
+    if (!rmw_uros_epoch_synchronized()) {
+        return;
+    }
+    int64_t now_us    = esp_timer_get_time();
+    int64_t offset_ns = rmw_uros_epoch_nanos() - now_us * 1000;
+
+    zlac_telemetry_t t;
+    motor_driver_zlac_get_telemetry(&t);
+    motor_health_t h;
+    motor_driver_get_health(&h);
+    bool armed = motor_driver_is_armed();
+
+    const double rpm_to_ms = M_PI * (double)WHEEL_DIAMETER_M / 60.0;
+    uint32_t flags = 0;
+    flags |= (t.boot_passed       ? 1u : 0u) << 0;
+    flags |= (t.heartbeat_fresh   ? 1u : 0u) << 1;
+    flags |= (t.tpdo_fresh        ? 1u : 0u) << 2;
+    flags |= (t.operation_enabled ? 1u : 0u) << 3;
+    flags |= (t.estop             ? 1u : 0u) << 4;
+    flags |= (t.fault             ? 1u : 0u) << 5;
+    flags |= (armed               ? 1u : 0u) << 6;
+    flags |= (h.online            ? 1u : 0u) << 7;
+
+    double *d = s_telem_data;
+    d[0]  = UROS_TELEMETRY_VERSION;
+    d[1]  = epoch_s(now_us, offset_ns);
+    d[2]  = epoch_s(s_cmd_rx_us, offset_ns);
+    d[3]  = (double)s_cmd_rx_count;
+    d[4]  = s_cmd_rx_lin;
+    d[5]  = s_cmd_rx_ang;
+    d[6]  = epoch_s(t.rpdo_us, offset_ns);
+    d[7]  = t.target_wheel_rpm[0] * rpm_to_ms;
+    d[8]  = t.target_wheel_rpm[1] * rpm_to_ms;
+    d[9]  = epoch_s(t.velocity_us, offset_ns);
+    d[10] = t.actual_wheel_rpm[0] * rpm_to_ms;
+    d[11] = t.actual_wheel_rpm[1] * rpm_to_ms;
+    d[12] = epoch_s(t.current_us, offset_ns);
+    d[13] = t.current_a[0];
+    d[14] = t.current_a[1];
+    d[15] = (double)flags;
+    d[16] = (double)rc_failsafe_get_mode();
+    d[17] = t.heartbeat_age_ms == UINT32_MAX ? NAN : (double)t.heartbeat_age_ms * 1e-3;
+    d[18] = t.accel_ms == UINT32_MAX ? NAN : (double)t.accel_ms;
+    d[19] = t.decel_ms == UINT32_MAX ? NAN : (double)t.decel_ms;
+    d[20] = t.statusword[0];
+    d[21] = t.statusword[1];
+    d[22] = (double)t.profile_errors;
+    d[23] = (double)t.rpdo_errors;
+
+    rcl_publish(pub, &s_telem_msg, NULL);
+}
+#endif
 
 /* Per-VESC health → sensor_msgs/BatteryState.
  * VESC-specific path: queries motor_driver_vesc directly for the per-
@@ -339,6 +439,26 @@ static void uros_task_fn(void *arg)
             ESP_LOGE(TAG, "rc_active publisher init failed: %d", (int)rc);
         }
 
+#ifdef CONFIG_UROS_CHASSIS_TELEMETRY
+        /* Best effort: one message fits a transport frame, and a lost
+         * sample must not hold up odom on the reliable stream. */
+        rcl_publisher_t telem_pub;
+        rc = rclc_publisher_init_best_effort(&telem_pub, &node,
+            ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float64MultiArray),
+            "chassis/telemetry");
+        bool telem_ok = (rc == RCL_RET_OK);
+        if (!telem_ok) {
+            ESP_LOGE(TAG, "chassis/telemetry publisher init failed: %d", (int)rc);
+        }
+        s_telem_msg.layout.dim.data      = NULL;
+        s_telem_msg.layout.dim.size      = 0;
+        s_telem_msg.layout.dim.capacity  = 0;
+        s_telem_msg.layout.data_offset   = 0;
+        s_telem_msg.data.data            = s_telem_data;
+        s_telem_msg.data.size            = UROS_TELEMETRY_LEN;
+        s_telem_msg.data.capacity        = UROS_TELEMETRY_LEN;
+#endif
+
 #ifdef CONFIG_MOTOR_DRIVER_VESC
         rcl_publisher_t battery_pub[2];
         bool battery_ok[2];
@@ -367,6 +487,16 @@ static void uros_task_fn(void *arg)
             ESP_LOGE(TAG, "cmd_vel subscription init failed: %d", (int)rc);
         }
 
+#ifdef CONFIG_ZLAC_RUNTIME_PROFILE
+        rcl_subscription_t profile_sub;
+        rc = rclc_subscription_init_default(&profile_sub, &node,
+            ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int32), "chassis/profile_ms");
+        bool profile_sub_ok = (rc == RCL_RET_OK);
+        if (!profile_sub_ok) {
+            ESP_LOGE(TAG, "chassis/profile_ms subscription init failed: %d", (int)rc);
+        }
+#endif
+
         /* ── Services ───────────────────────────────────────────── */
         /* reset_odom (std_srvs/Trigger): zero the odom pose without a
          * reboot — for bench odometry-closure calibration.  Non-critical:
@@ -380,9 +510,15 @@ static void uros_task_fn(void *arg)
         }
 
         /* ── Executor ───────────────────────────────────────────── */
-        /* Handles: cmd_vel subscription + reset_odom service. */
+        /* Handles: cmd_vel subscription + reset_odom service (+ the bench
+         * profile subscription). */
         rclc_executor_t executor;
-        rc = rclc_executor_init(&executor, &support.context, 2, &allocator);
+#ifdef CONFIG_ZLAC_RUNTIME_PROFILE
+        const size_t n_handles = 3;
+#else
+        const size_t n_handles = 2;
+#endif
+        rc = rclc_executor_init(&executor, &support.context, n_handles, &allocator);
         bool exec_init_ok = (rc == RCL_RET_OK);
         if (!exec_init_ok) {
             ESP_LOGE(TAG, "executor init failed: %d", (int)rc);
@@ -407,6 +543,16 @@ static void uros_task_fn(void *arg)
                 ESP_LOGE(TAG, "executor add reset_odom failed: %d", (int)rc);
             }
         }
+#ifdef CONFIG_ZLAC_RUNTIME_PROFILE
+        if (exec_init_ok && profile_sub_ok) {
+            rc = rclc_executor_add_subscription(&executor, &profile_sub,
+                                                &s_profile_msg, &profile_cb,
+                                                ON_NEW_DATA);
+            if (rc != RCL_RET_OK) {
+                ESP_LOGE(TAG, "executor add chassis/profile_ms failed: %d", (int)rc);
+            }
+        }
+#endif
 
         /* ── Init odom message frame IDs ────────────────────────── */
         /* micro-ROS static strings — set once */
@@ -487,6 +633,9 @@ static void uros_task_fn(void *arg)
             if (odom_ok)     publish_odom(&odom_pub);
             if (failsafe_ok) publish_failsafe(&failsafe_pub);
             if (rc_active_ok) publish_rc_active(&rc_active_pub);
+#ifdef CONFIG_UROS_CHASSIS_TELEMETRY
+            if (telem_ok)    publish_telemetry(&telem_pub);
+#endif
 #ifdef CONFIG_MOTOR_DRIVER_VESC
             if (battery_ok[0]) publish_battery(&battery_pub[0], VESC_ID_LEFT,  0);
             if (battery_ok[1]) publish_battery(&battery_pub[1], VESC_ID_RIGHT, 1);
@@ -499,6 +648,12 @@ static void uros_task_fn(void *arg)
         if (exec_init_ok) rclc_executor_fini(&executor);
         if (reset_srv_ok) rcl_service_fini(&reset_odom_srv, &node);
         if (sub_ok)       rcl_subscription_fini(&cmd_vel_sub, &node);
+#ifdef CONFIG_ZLAC_RUNTIME_PROFILE
+        if (profile_sub_ok) rcl_subscription_fini(&profile_sub, &node);
+#endif
+#ifdef CONFIG_UROS_CHASSIS_TELEMETRY
+        if (telem_ok)     rcl_publisher_fini(&telem_pub, &node);
+#endif
 #ifdef CONFIG_MOTOR_DRIVER_VESC
         if (battery_ok[1]) rcl_publisher_fini(&battery_pub[1], &node);
         if (battery_ok[0]) rcl_publisher_fini(&battery_pub[0], &node);
